@@ -666,6 +666,7 @@ export async function prepareQixiMemoryBundle(
         userLayerColor?: string;
     } = {},
 ): Promise<QixiMemoryPreparation> {
+
     let messages: Message[] = [];
     try { messages = await loadCharacterContextMessages(char); } catch { /* fallback below */ }
     const contextSignature = buildContextSignature(messages, char, user);
@@ -714,9 +715,9 @@ export async function prepareQixiMemoryBundle(
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiConfig.apiKey}` },
                     body: JSON.stringify({
                         model: apiConfig.model,
-                        messages: ContextBuilder.buildCharacterRequest({ char: memoryChar, user }, [
+                        messages: (await ContextBuilder.buildCharacterRequest({ char: memoryChar, user }, [
                             { role: 'user', content: userContent },
-                        ]),
+                        ])),
                         temperature: 0.68,
                         max_tokens: 32000,
                         // 七夕首轮内容较长。强制使用流式传输，让上游尽早返回响应头/数据片段，
@@ -726,7 +727,17 @@ export async function prepareQixiMemoryBundle(
                 },
                 0,
                 QIXI_PART1_TIMEOUT_MS,
-                { appId: 'special-moments', charId: char.id, purpose: `qixi-dual-layer-part1${phase === 'first' ? 'a' : phase === 'second' ? 'b' : 'c-bridge'}-v19` },
+                {
+                    appId: 'special-moments',
+                    appName: '七夕特别时刻',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: phase === 'first'
+                        ? '七夕双层记忆·上篇'
+                        : phase === 'second'
+                            ? '七夕双层记忆·中篇'
+                            : '七夕双层记忆·下篇与鹊桥',
+                },
                 {}, // Incremental SSE reader stops on [DONE] even if the proxy keeps the socket open.
             );
             const content = data?.choices?.[0]?.message?.content;

@@ -432,6 +432,7 @@ export const requestAvatarTouchReply = async (options: {
   hit: AvatarTouchHit;
   modelActions?: AvatarTouchModelAction[];
 }): Promise<AvatarTouchReply> => {
+
   const {
     character,
     user,
@@ -487,11 +488,11 @@ export const requestAvatarTouchReply = async (options: {
     },
     body: JSON.stringify({
       model: apiConfig.model,
-      messages: ContextBuilder.buildCharacterRequest(characterContextInput, [
+      messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
         { role: 'system', content: systemPrompt },
         ...apiMessages,
         { role: 'user', content: eventText },
-      ]),
+      ])),
       temperature: 0.9,
       max_tokens: 1200,
       stream: false,
@@ -828,6 +829,7 @@ export const requestAvatarTouchReactionPack = async (options: {
   voiceLanguage?: string;
   outputMode?: AvatarTouchPackOutputMode;
 }): Promise<AvatarTouchReactionPack> => {
+
   const {
     character,
     user,
@@ -885,11 +887,11 @@ export const requestAvatarTouchReactionPack = async (options: {
     },
     body: JSON.stringify({
       model: apiConfig.model,
-      messages: ContextBuilder.buildCharacterRequest(characterContextInput, [
+      messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
         { role: 'system', content: systemPrompt },
         ...apiMessages,
         { role: 'user', content: eventText },
-      ]),
+      ])),
       temperature: 0.92,
       max_tokens: 4800,
       stream: false,
@@ -901,6 +903,7 @@ export const requestAvatarTouchReactionPack = async (options: {
   // but align its timeout policy with normal chat instead of killing valid
   // long generations before the optional TTS phase has even started.
   }, 0, 0, {
+    appId: 'companion',
     appName: '触感陪伴',
     charId: character.id,
     charName: character.name,

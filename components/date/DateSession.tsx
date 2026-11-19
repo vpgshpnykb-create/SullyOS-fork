@@ -1,5 +1,5 @@
-import {meetingAppearance, MEETING_READING_CSS} from '../../utils/meetingAppearance';
-import React, { useState, useEffect, useLayoutEffect, useRef, forwardRef, useImperativeHandle } from 'react';
+import {meetingAppearance, MEETING_READING_CSS, meetingCustomCss} from '../../utils/meetingAppearance';
+import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
 import { CharacterProfile, Message, DateState, DialogueItem, UserProfile, DateObservation } from '../../types';
 import Modal from '../../components/os/Modal';
 import { useOS } from '../../context/OSContext';
@@ -24,10 +24,16 @@ import { fetchBlobForShare } from '../../utils/shareExport';
 import VoiceFavoriteActionSheet from '../voice/VoiceFavoriteActionSheet';
 import { getVoiceFavorite, makeVoiceFavoriteId, removeVoiceFavorite, saveVoiceFavorite } from '../../utils/voiceFavorites';
 import { MEETING_CONTINUE_DISPLAY_TEXT } from '../../utils/meetingContinue';
-import { VOICE_LANGUAGE_OPTIONS, voiceLanguageAnalyticsValue, voiceLanguageLabel, voiceLanguagePromptLabel } from '../../utils/voiceLanguage';
+import { VOICE_LANGUAGE_OPTIONS, voiceLanguageAnalyticsValue, voiceLanguageLabel } from '../../utils/voiceLanguage';
 import { trackEvent } from '../../utils/analytics';
 import { SARSpeechSwitch } from '../sar/SARSpeechSwitch';
 import { resolveSARDateSpeech } from '../../utils/sarDatePresentation';
+import { extractDateDialogueText as extractDialogueText, normalizeDateVoiceLines, stripDateVoiceTranslations, resolveDateSpeechText, buildDateReadingScript, dateVoiceCacheKey } from '../../utils/dateVoiceText';
+import { isElevenLabsV4Model } from '../../utils/elevenLabsModels';
+import { useStreamingVoice } from '../../hooks/useStreamingVoice';
+import StreamingVoiceBar from '../voice/StreamingVoiceBar';
+import { streamElevenLabsSpeech, type StreamedVoice } from '../../utils/elevenLabsStream';
+import { useDateReadingScroll } from '../../utils/useDateReadingScroll';
 
 // 语音情绪标记 [v:xxx]：跟立绘情绪 [emotion] 分开的独立通道。立绘的 happy 是
 // 夸张的表情、语音的 happy 是音色情绪，两者强度/语义差异大，不能一概而论。
@@ -58,7 +64,7 @@ const isContextNoise = (line: string) => {
 const cleanTextForDisplay = (text: string) => {
     // Remove content inside brackets [] and trim extra spaces
     // Also remove typical system prompts if any leak through
-    return text.replace(/\[.*?\]/g, '').trim();
+    return stripDateVoiceTranslations(text).replace(/\[.*?\]/g, '').trim();
 };
 
 // Helper: Check if a line is dialogue (starts with quoted speech "...")
@@ -69,20 +75,9 @@ const isDialogueLine = (text: string) => {
     return /^[""\u201C\u300C]/.test(clean);
 };
 
-// Helper: Extract only the dialogue text from a line for TTS
-const extractDialogueText = (text: string): string => {
-    const clean = cleanTextForDisplay(text);
-    const matches = clean.match(/["\u201C]([^"\u201D]*)["\u201D]/g)
-        || clean.match(/[\u300C]([^\u300D]*)[\u300D]/g);
-    if (matches) {
-        return matches.map(m => m.replace(/["\u201C\u201D\u300C\u300D]/g, '')).join(' ');
-    }
-    return clean;
-};
-
 const parseDialogue = (fullText: string, initialEmotion: string = 'normal'): DialogueItem[] => {
     if (!fullText) return [];
-    const lines = fullText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const lines = normalizeDateVoiceLines(fullText).split('\n').map(l => l.trim()).filter(l => l.length > 0);
     const results: DialogueItem[] = [];
     let currentEmotion = initialEmotion;
 
@@ -123,6 +118,10 @@ interface DateSessionProps {
     messages: Message[]; // The DB messages for history/novel mode
     peekStatus: string;  // Initial text from the Peek phase
     initialState?: DateState; // Resume state
+    /** 每次渲染写入当前画面状态，挂起时父组件从这里取（见 docs/date-leave-reminder.md）。 */
+    snapshotRef?: React.MutableRefObject<DateState | null>;
+    /** 挂起时还没回来的那次回复：恢复后显示「正在输入」，落定前不让重试。 */
+    pendingTurn?: Promise<unknown>;
     encounterId?: string;
     onSendMessage: (text: string, kind?: 'continue') => Promise<string>; // Returns AI content
     onReroll: () => Promise<string>;
@@ -141,12 +140,13 @@ interface DateSessionProps {
 
 const REQUIRED_EMOTIONS_SET = ['normal', 'happy', 'angry', 'sad', 'shy'];
 
-type DateSpeechResult = { url: string; spokenText: string };
+type DateSpeechResult = { url: string; spokenText: string; recording?: StreamedVoice };
 type DateVoiceFavoriteTarget = {
     sourceKey: string;
     originalText: string;
     sourceTimestamp: number;
     voiceEmotion?: string;
+    speechText?: string;
 };
 
 const ReadingAvatar: React.FC<{ src?: string; name: string; light: boolean }> = ({ src, name, light }) => {
@@ -191,6 +191,8 @@ const DateSession: React.FC<DateSessionProps> = ({
     messages: historyMessages,
     peekStatus, 
     initialState,
+    snapshotRef,
+    pendingTurn,
     encounterId,
     onSendMessage, 
     onReroll, 
@@ -228,10 +230,10 @@ const DateSession: React.FC<DateSessionProps> = ({
     
     // Interaction State
     const messages = React.useMemo(() => encounterId ? historyMessages.filter(message => message.metadata?.dateEncounterId === encounterId) : historyMessages, [historyMessages, encounterId]);
-    const [input, setInput] = useState('');
-    const [showInputBox, setShowInputBox] = useState(!peekStatus && !initialState);
-    const [isTyping, setIsTyping] = useState(false); // Waiting for API
-    const [isShowingOpening, setIsShowingOpening] = useState(!!peekStatus && !initialState); // True until first user interaction
+    const [input, setInput] = useState(initialState?.draftInput ?? '');
+    const [showInputBox, setShowInputBox] = useState(initialState ? !!initialState.draftInput : !peekStatus);
+    const [isTyping, setIsTyping] = useState(!!pendingTurn); // Waiting for API
+    const [isShowingOpening, setIsShowingOpening] = useState(initialState ? !!initialState.showingOpening : !!peekStatus); // True until first user interaction
     // API 失败时本地记住本轮输入，不依赖父组件的 DB 刷新是否已经完成；用户可直接点重试。
     const [pendingRetryText, setPendingRetryText] = useState('');
     const [sarTruthMessageIds, setSarTruthMessageIds] = useState<Set<number>>(new Set());
@@ -264,9 +266,8 @@ const DateSession: React.FC<DateSessionProps> = ({
     const [selectedMsgIds, setSelectedMsgIds] = useState<Set<number>>(new Set());
     const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const touchStartRef = useRef<{x: number, y: number} | null>(null);
-    const novelScrollRef = useRef<HTMLDivElement>(null);
 
-    // Voice TTS — single shared cache keyed by dialogue text, used by both GAL & novel mode
+    // GAL、阅读与收藏共享完整音频缓存，按台词、语言和合成参数区分。
     const [dateVoicePlaying, setDateVoicePlaying] = useState(false);
     const [galVoiceLoading, setGalVoiceLoading] = useState(false);
     const [showVoiceLangPicker, setShowVoiceLangPicker] = useState(false);
@@ -275,8 +276,26 @@ const DateSession: React.FC<DateSessionProps> = ({
     const [novelPlayingId, setNovelPlayingId] = useState<string | null>(null);
 
     const dateAudioRef = useRef<HTMLAudioElement | null>(null);
+    const streamingVoice = useStreamingVoice(char.id);
+    const dateVoiceGenerationRef = useRef(0);
+    const dateStreamUrls = useRef(new Set<string>());
+    const stopDateStream = () => { dateVoiceGenerationRef.current += 1; streamingVoice.stop(); };
+    useEffect(() => () => {
+        dateVoiceGenerationRef.current += 1;
+        dateStreamUrls.current.forEach(url => URL.revokeObjectURL(url));
+        dateStreamUrls.current.clear();
+        voiceCacheRef.current = {};
+    }, [char.id]);
+    useEffect(() => {
+        if (apiConfig.ttsProvider !== 'elevenlabs') return;
+        const state = streamingVoice.state;
+        setDateVoicePlaying(state?.status === 'playing');
+        setGalVoiceLoading(state?.id === 'gal' && state.status === 'loading');
+        setNovelPlayingId(state && ['loading', 'playing'].includes(state.status) ? state.id : null);
+    }, [streamingVoice.state, apiConfig.ttsProvider]);
     const voiceEnabled = !!char.dateVoiceEnabled;
     const voiceLang = char.dateVoiceLang || '';
+    const preserveAudioTags = apiConfig.ttsProvider === 'elevenlabs' && isElevenLabsV4Model(apiConfig.elevenLabsModel);
     // Bridges the current line's VOICE emotion ([v:xxx], 跟立绘情绪分开) to the GAL
     // voice effect (which keys off currentText only). undefined = 不传情绪，自然朗读。
     // A ref so it doesn't churn the effect's deps.
@@ -287,39 +306,49 @@ const DateSession: React.FC<DateSessionProps> = ({
     const voiceFavoriteLongPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const voiceFavoriteLongPressTriggered = useRef(false);
 
-    const translateAndSpeak = async (text: string, emotion?: string): Promise<DateSpeechResult | null> => {
-        if (!canSynthesizeSpeech(char, apiConfig)) return null;
+    const speechTextForLine = (text: string) => resolveDateSpeechText(text, voiceLang, preserveAudioTags);
+    const displayTextForLine = (text: string) => stripTtsMarkupForDisplay(cleanTextForDisplay(text), apiConfig);
+    const speechCacheKey = (text: string, emotion?: string) => dateVoiceCacheKey(text, char, apiConfig, emotion);
+    const speakDateText = async (text: string, emotion?: string, streamId?: string): Promise<DateSpeechResult | null> => {
+        const generation = dateVoiceGenerationRef.current;
+        const cacheKey = speechCacheKey(text, emotion);
         try {
-            let ttsText = cleanTextForTtsProvider(text, apiConfig);
+            const cached = voiceCacheRef.current[cacheKey];
+            if (cached) {
+                if (streamId && cached.recording) {
+                    dateAudioRef.current?.pause();
+                    await streamingVoice.replay(streamId, cached.recording);
+                }
+                return cached;
+            }
+            if (!canSynthesizeSpeech(char, apiConfig)) return null;
+            const ttsText = cleanTextForTtsProvider(text, apiConfig);
             if (!ttsText || ttsText.length < 2) return null;
-            if (voiceLang) {
-                const langLabel = voiceLanguagePromptLabel(voiceLang);
-                try {
-                    const transRes = await fetch(`${apiConfig.baseUrl}/chat/completions`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiConfig.apiKey}` },
-                        body: JSON.stringify({
-                            model: apiConfig.model,
-                            messages: [{ role: 'system', content: `Translate the following text to ${langLabel}. Output ONLY the translation, nothing else.` }, { role: 'user', content: ttsText }],
-                            temperature: 0.3,
-                        }),
-                    });
-                    const transData = await transRes.json();
-                    const translated = transData?.choices?.[0]?.message?.content?.trim();
-                    if (translated) ttsText = translated;
-                } catch { /* use original */ }
+            if (apiConfig.ttsProvider === 'elevenlabs') {
+                if (generation !== dateVoiceGenerationRef.current) return null;
+                if (streamId) dateAudioRef.current?.pause();
+                const options = { languageBoost: voiceLang || undefined, emotion };
+                const recording = streamId
+                    ? await streamingVoice.speak(streamId, ttsText, char, apiConfig, options)
+                    : await streamElevenLabsSpeech(ttsText, char, apiConfig, options);
+                if (generation !== dateVoiceGenerationRef.current) return null;
+                const url = URL.createObjectURL(recording.blob);
+                dateStreamUrls.current.add(url);
+                return voiceCacheRef.current[cacheKey] = { url, spokenText: stripTtsMarkupForDisplay(ttsText, apiConfig), recording };
             }
             const url = await synthesizeSpeech(ttsText, char, apiConfig, {
                 languageBoost: voiceLang || undefined,
                 groupId: apiConfig.minimaxGroupId || undefined,
                 emotion,
             });
-            return {
+            return voiceCacheRef.current[cacheKey] = {
                 url,
                 spokenText: stripTtsMarkupForDisplay(ttsText, apiConfig),
             };
         } catch (err: any) {
+            if (err?.name === 'AbortError') return null;
             console.warn('Date TTS failed:', err?.message);
+            if (apiConfig.ttsProvider === 'elevenlabs') addToast(err?.message || '语音生成失败', 'error');
             return null;
         }
     };
@@ -339,14 +368,18 @@ const DateSession: React.FC<DateSessionProps> = ({
         if (isShowingOpening) return;
         if (!isDialogueLine(galShownText)) return;
         let cancelled = false;
-        const dialogueText = extractDialogueText(galShownText);
-        const cacheKey = dialogueText;
+        const dialogueText = speechTextForLine(galShownText);
+        if (apiConfig.ttsProvider === 'elevenlabs') {
+            void speakDateText(dialogueText, currentLineEmotionRef.current, 'gal');
+            return () => { cancelled = true; stopDateStream(); };
+        }
+        const cacheKey = speechCacheKey(dialogueText, currentLineEmotionRef.current);
         const play = async () => {
             // Check cache first
             let speech: DateSpeechResult | undefined = voiceCacheRef.current[cacheKey];
             if (!speech) {
                 setGalVoiceLoading(true);
-                speech = await translateAndSpeak(dialogueText, currentLineEmotionRef.current) || undefined;
+                speech = await speakDateText(dialogueText, currentLineEmotionRef.current) || undefined;
                 if (cancelled) return;
                 setGalVoiceLoading(false);
                 if (!speech) return;
@@ -361,23 +394,30 @@ const DateSession: React.FC<DateSessionProps> = ({
         };
         play();
         return () => { cancelled = true; setGalVoiceLoading(false); if (dateAudioRef.current) { dateAudioRef.current.pause(); } };
-    }, [galShownText, voiceEnabled, isNovelMode]);
+    }, [galShownText, voiceEnabled, isNovelMode, preserveAudioTags]);
 
     // GAL mode: manual play/pause for the current dialogue line
     const handleGalVoiceToggle = async () => {
         if (!galShownText || !isDialogueLine(galShownText)) return;
+        if (apiConfig.ttsProvider === 'elevenlabs') {
+            if (streamingVoice.state && ['loading', 'playing'].includes(streamingVoice.state.status)) { stopDateStream(); return; }
+            stopDateStream();
+            const text = speechTextForLine(galShownText);
+            await speakDateText(text, currentLineEmotionRef.current, 'gal');
+            return;
+        }
         // If playing, pause
         if (dateVoicePlaying && dateAudioRef.current) {
             dateAudioRef.current.pause();
             setDateVoicePlaying(false);
             return;
         }
-        const dialogueText = extractDialogueText(galShownText);
-        const cacheKey = dialogueText;
+        const dialogueText = speechTextForLine(galShownText);
+        const cacheKey = speechCacheKey(dialogueText, currentLineEmotionRef.current);
         let speech: DateSpeechResult | undefined = voiceCacheRef.current[cacheKey];
         if (!speech) {
             setGalVoiceLoading(true);
-            speech = await translateAndSpeak(dialogueText, currentLineEmotionRef.current) || undefined;
+            speech = await speakDateText(dialogueText, currentLineEmotionRef.current) || undefined;
             setGalVoiceLoading(false);
             if (!speech) { addToast('语音合成失败，请稍后重试', 'error'); return; }
             voiceCacheRef.current[cacheKey] = speech;
@@ -394,7 +434,13 @@ const DateSession: React.FC<DateSessionProps> = ({
     // 且命中同一条持久缓存（ttsCache/IndexedDB）——退出见面再进来点旧台词也能从本地缓存秒取，
     // 不必按不同的 key 重新联网合成。
     const handleNovelLinePlay = async (lineKey: string, dialogueText: string, voiceEmotion?: string) => {
-        const cached = voiceCacheRef.current[dialogueText];
+        if (apiConfig.ttsProvider === 'elevenlabs') {
+            if (streamingVoice.state?.id === lineKey && ['loading', 'playing'].includes(streamingVoice.state.status)) { stopDateStream(); return; }
+            stopDateStream();
+            await speakDateText(dialogueText, voiceEmotion, lineKey);
+            return;
+        }
+        const cached = voiceCacheRef.current[speechCacheKey(dialogueText, voiceEmotion)];
         if (cached) {
             // Already have URL (from GAL or previous novel play), just play/pause
             if (!dateAudioRef.current) dateAudioRef.current = new Audio();
@@ -410,10 +456,9 @@ const DateSession: React.FC<DateSessionProps> = ({
             return;
         }
         setNovelVoiceLoading(prev => new Set(prev).add(lineKey));
-        const speech = await translateAndSpeak(dialogueText, voiceEmotion);
+        const speech = await speakDateText(dialogueText, voiceEmotion);
         setNovelVoiceLoading(prev => { const n = new Set(prev); n.delete(lineKey); return n; });
         if (!speech) { addToast('语音合成失败，请稍后重试', 'error'); return; }
-        voiceCacheRef.current[dialogueText] = speech;
         if (!dateAudioRef.current) dateAudioRef.current = new Audio();
         dateAudioRef.current.src = speech.url;
         dateAudioRef.current.onended = () => setNovelPlayingId(null);
@@ -428,13 +473,14 @@ const DateSession: React.FC<DateSessionProps> = ({
             const message = messages[messageIndex];
             if (message.role !== 'assistant') continue;
             const { rest: body } = extractObservation(message.content || '', { lenient: observeEnabled, custom: char.dateObserve?.custom });
-            const lines = body.split('\n');
+            const lines = normalizeDateVoiceLines(body).split('\n');
             for (let lineIndex = lines.length - 1; lineIndex >= 0; lineIndex--) {
                 const parsed = extractVoiceEmotionTag(lines[lineIndex]);
                 if (isDialogueLine(parsed.rest) && extractDialogueText(parsed.rest) === originalText) {
                     return {
                         sourceKey: `${char.id}:${message.id}-${lineIndex}`,
                         originalText,
+                        speechText: speechTextForLine(parsed.rest),
                         sourceTimestamp: message.timestamp,
                         voiceEmotion: parsed.voiceEmotion || currentLineEmotionRef.current,
                     };
@@ -444,6 +490,7 @@ const DateSession: React.FC<DateSessionProps> = ({
         return {
             sourceKey: `${char.id}:live:${makeVoiceFavoriteId('date', originalText)}`,
             originalText,
+            speechText: speechTextForLine(galShownText),
             sourceTimestamp: Date.now(),
             voiceEmotion: currentLineEmotionRef.current,
         };
@@ -484,10 +531,10 @@ const DateSession: React.FC<DateSessionProps> = ({
                 addToast('已取消收藏语音', 'info');
                 return;
             }
-            let speech: DateSpeechResult | undefined = voiceCacheRef.current[target.originalText];
+            const speechText = target.speechText || target.originalText;
+            let speech: DateSpeechResult | undefined = voiceCacheRef.current[speechCacheKey(speechText, target.voiceEmotion)];
             if (!speech) {
-                speech = await translateAndSpeak(target.originalText, target.voiceEmotion) || undefined;
-                if (speech) voiceCacheRef.current[target.originalText] = speech;
+                speech = await speakDateText(speechText, target.voiceEmotion) || undefined;
             }
             if (!speech) throw new Error('语音合成失败，请稍后重试');
             const blob = await fetchBlobForShare(speech.url, 'audio/mpeg');
@@ -588,7 +635,7 @@ const DateSession: React.FC<DateSessionProps> = ({
             setCurrentSprite(restoredSprite.src);
             setCurrentSpriteKey(restoredSprite.key);
             setCurrentText(initialState.currentText || '');
-            setDisplayedText(initialState.currentText || '');
+            setDisplayedText(cleanTextForDisplay(initialState.currentText || ''));
             setDialogueQueue(Array.isArray(initialState.dialogueQueue) ? initialState.dialogueQueue : []);
             setDialogueBatch(Array.isArray(initialState.dialogueBatch) ? initialState.dialogueBatch : []);
             setIsNovelMode(!!initialState.isNovelMode);
@@ -628,50 +675,37 @@ const DateSession: React.FC<DateSessionProps> = ({
         }
     }, [char, currentSpriteKey]);
 
-    // Novel Mode Scroll
-    const readingPosition = useRef({ first: 0, last: 0, height: 0, top: 0, nearBottom: true, active: false });
-    useLayoutEffect(() => {
-        const element = novelScrollRef.current;
-        const previous = readingPosition.current;
-        if (!isNovelMode || !element) { previous.active = false; return; }
-        const first = visibleSessionMessages[0]?.id || 0;
-        const last = visibleSessionMessages.at(-1)?.id || 0;
-        if (!previous.active || !previous.last) element.scrollTop = element.scrollHeight;
-        else if (first && first < previous.first) element.scrollTop = previous.top + element.scrollHeight - previous.height;
-        else if (previous.nearBottom) element.scrollTop = element.scrollHeight;
-        readingPosition.current = { first, last, height: element.scrollHeight, top: element.scrollTop,
-            nearBottom: element.scrollHeight - element.clientHeight - element.scrollTop < 100, active: true };
-    }, [visibleSessionMessages, isNovelMode, showInputBox]);
-    const onReadingScroll = () => {
-        const element = novelScrollRef.current;
-        if (!element) return;
-        const movingUp = element.scrollTop < readingPosition.current.top;
-        readingPosition.current.top = element.scrollTop;
-        readingPosition.current.height = element.scrollHeight;
-        readingPosition.current.nearBottom = element.scrollHeight - element.clientHeight - element.scrollTop < 100;
-        if (movingUp && element.scrollTop < 80 && !historyLoading && !historyReachedEnd && !historyError)
-            void onLoadMoreHistory?.();
-    };
+    // Deferred message layout changes the scroll height after mounting/switching modes.
+    // Follow the end or a visible message, including after those later size changes.
+    const { scrollRef: novelScrollRef, contentRef: novelContentRef, onScroll: onReadingScroll } = useDateReadingScroll({
+        active: isNovelMode,
+        messages: visibleSessionMessages,
+        layoutKey: showInputBox,
+        onLoadOlder: () => {
+            if (!historyLoading && !historyReachedEnd && !historyError) void onLoadMoreHistory?.();
+        },
+    });
 
     // Typewriter effect
     useEffect(() => {
+        const displayText = displayTextForLine(currentText);
         if (!currentText || isNovelMode) {
-            if (isNovelMode) setDisplayedText(currentText);
+            if (isNovelMode) setDisplayedText(displayText);
             return;
         }
         setIsTextAnimating(true);
         setDisplayedText('');
         let i = 0;
         const timer = setInterval(() => {
-            setDisplayedText(currentText.substring(0, i + 1));
+            setDisplayedText(displayText.substring(0, i + 1));
             i++;
-            if (i >= currentText.length) {
+            if (i >= displayText.length) {
                 clearInterval(timer);
                 setIsTextAnimating(false);
             }
         }, 20);
         return () => clearInterval(timer);
-    }, [currentText, isNovelMode]);
+    }, [currentText, isNovelMode, preserveAudioTags]);
 
     // --- Logic ---
 
@@ -709,8 +743,15 @@ const DateSession: React.FC<DateSessionProps> = ({
         return '';
     }, [messages]);
     const dialogueSyncMountRef = useRef(false);
+    // 从挂起恢复：记录是挂载后才异步读回来的，读回来的还是挂起时那条就别重播（会把播放位置
+    // 拉回批次开头）；不一样说明离开期间回复到了，照常接着播。
+    const restoredAssistantRef = useRef(initialState ? initialState.lastAssistantContent ?? '' : undefined);
     useEffect(() => {
-        if (!dialogueSyncMountRef.current) { dialogueSyncMountRef.current = true; return; }
+        if (restoredAssistantRef.current !== undefined) {
+            if (!lastAssistantContent || lastAssistantContent === restoredAssistantRef.current) return;
+            restoredAssistantRef.current = undefined;
+            dialogueSyncMountRef.current = true;
+        } else if (!dialogueSyncMountRef.current) { dialogueSyncMountRef.current = true; return; }
         if (isTyping || !lastAssistantContent) return;
         const { rest } = extractObservation(lastAssistantContent, { lenient: observeEnabled, custom: char.dateObserve?.custom });
         const items = parseDialogue(rest, 'normal');
@@ -736,7 +777,7 @@ const DateSession: React.FC<DateSessionProps> = ({
 
         // Skip animation
         if (isTextAnimating) {
-            setDisplayedText(currentText);
+            setDisplayedText(displayTextForLine(currentText));
             setIsTextAnimating(false);
             return;
         }
@@ -815,7 +856,21 @@ const DateSession: React.FC<DateSessionProps> = ({
         }
     };
 
-    // Messages are persisted per turn; leaving ends this encounter. No resume snapshot.
+    // 挂起：父组件卸载时从 snapshotRef 取走这一份，回来时作为 initialState 交回。
+    if (snapshotRef) snapshotRef.current = {
+        dialogueQueue, dialogueBatch, currentText, currentSpriteKey,
+        activeSkinSetId: char.activeSkinSetId, isNovelMode, timestamp: Date.now(), peekStatus,
+        ...(observation ? { observation } : {}),
+        lastAssistantContent, showingOpening: isShowingOpening, draftInput: input,
+    };
+
+    // 挂起前发出去的那次回复还在路上：等它落定再放开输入（父组件会刷新记录，新回复由上面的同步接着播）。
+    useEffect(() => {
+        if (!pendingTurn) return;
+        let alive = true;
+        pendingTurn.finally(() => { if (alive) setIsTyping(false); }).catch(() => {});
+        return () => { alive = false; };
+    }, [pendingTurn]);
 
     // Message Touch Logic (Robust version for scrollable lists)
     const handleMsgTouchStart = (e: React.TouchEvent | React.MouseEvent, msg: Message) => {
@@ -885,7 +940,10 @@ const DateSession: React.FC<DateSessionProps> = ({
     const canReroll = messages.length > 0 && messages[messages.length - 1].role === 'assistant';
 
     return (
-        <div className={`h-full w-full relative bg-black overflow-hidden font-sans select-none ${decoratedReading ? 'meeting-reading' : ''}`} data-reading-preset={readingStyle.id} onClick={handleScreenClick}><style>{MEETING_READING_CSS}</style>
+        <div className={`h-full w-full relative bg-black overflow-hidden font-sans select-none ${decoratedReading ? 'meeting-reading' : ''}`} data-reading-preset={readingStyle.id} onPointerDownCapture={() => { if (voiceEnabled && apiConfig.ttsProvider === 'elevenlabs') streamingVoice.prime(); }} onClick={handleScreenClick}><style>{MEETING_READING_CSS + '\n' + meetingCustomCss(char.dateAppearance)}</style>
+            <div className="absolute inset-x-0 bottom-28 z-[105] pointer-events-auto">
+                <StreamingVoiceBar state={streamingVoice.state} onStop={stopDateStream} />
+            </div>
             
             {/* Background Layer */}
             <div 
@@ -954,6 +1012,7 @@ const DateSession: React.FC<DateSessionProps> = ({
                         </button>
                         {voiceEnabled && showVoiceLangPicker && (
                             <div className="flex flex-wrap justify-end gap-1 max-w-[200px] animate-fade-in">
+                                <p className="w-full text-right text-[10px] leading-relaxed text-white/70">语种用于新回复；旧台词没有对应译文时朗读原文。已生成的语音可直接重播。</p>
                                 {VOICE_LANGUAGE_OPTIONS.map(opt => (
                                     <button key={opt.value} onClick={() => { updateCharacter(char.id, { dateVoiceLang: opt.value }); trackEvent('设置见面语音语种', { 语种: voiceLanguageAnalyticsValue(opt.value) }); setShowVoiceLangPicker(false); }}
                                         className={`h-7 px-2.5 rounded-full text-[10px] font-bold transition-all active:scale-95 whitespace-nowrap ${voiceLang === opt.value ? 'bg-white/30 text-white shadow-md' : 'bg-black/30 backdrop-blur-md text-white/60 border border-white/10'}`}>
@@ -1019,21 +1078,30 @@ const DateSession: React.FC<DateSessionProps> = ({
 
             {/* Novel Mode View */}
             {isNovelMode && (
-                <div ref={novelScrollRef} onScroll={onReadingScroll} style={{ overflowAnchor: 'none' }} className={`meeting-reading-page absolute inset-0 z-20 overflow-y-auto no-scrollbar pt-24 pb-32 px-8 mask-image-gradient overscroll-contain ${lightReading ? 'bg-[#faf8f5]' : 'bg-black/90 backdrop-blur-sm'}`} onClick={(e) => { e.stopPropagation(); if (showMenu) { setShowMenu(false); setShowVoiceLangPicker(false); return; } setShowInputBox(true); }}>
-                    <div className="min-h-full flex flex-col justify-end">
+                <div ref={novelScrollRef} onScroll={onReadingScroll} style={{ overflowAnchor: 'none', paddingBottom: streamingVoice.state && streamingVoice.state.status !== 'done' ? '13rem' : undefined }} className={`meeting-reading-page absolute inset-0 z-20 overflow-y-auto no-scrollbar pt-24 pb-32 px-8 mask-image-gradient overscroll-contain ${lightReading ? 'bg-[#faf8f5]' : 'bg-black/90 backdrop-blur-sm'}`} onClick={(e) => { e.stopPropagation(); if (showMenu) { setShowMenu(false); setShowVoiceLangPicker(false); return; } setShowInputBox(true); }}>
+                    <div ref={novelContentRef} className="min-h-full flex flex-col justify-end">
+                        {voiceEnabled && apiConfig.ttsProvider === 'elevenlabs' && <button className="self-center mb-4 rounded-full border border-emerald-300/40 bg-white/90 px-4 py-2 text-xs text-emerald-800" onClick={event => {
+                            event.stopPropagation(); stopDateStream();
+                            const chosen = messages.filter(message => message.role === 'assistant' && (!isBatchSelectMode || selectedMsgIds.has(message.id)));
+                            const source = isBatchSelectMode ? chosen : chosen.slice(-1);
+                            const script = source.map(message => extractObservation(message.content || '', { lenient: observeEnabled, custom: char.dateObserve?.custom }).rest)
+                                .map(body => buildDateReadingScript(body, voiceLang, preserveAudioTags)).join('\n\n');
+                            if (script.trim()) void speakDateText(script, undefined, 'reading');
+                            else addToast('请先选择有正文的角色消息', 'info');
+                        }}>{isBatchSelectMode ? '连续朗读所选内容' : '朗读最新一段'}</button>}
                         <div className="max-w-2xl mx-auto animate-fade-in space-y-6">
                             {isBatchSelectMode && (
-                                <div className="sticky top-0 z-20 flex items-center justify-between bg-white/90 border border-stone-200 rounded-xl px-3 py-2 text-xs text-stone-700">
+                                <div className="meeting-batch-toolbar sticky top-0 z-20 flex flex-col items-center gap-2 bg-white/90 border border-stone-200 rounded-xl px-3 py-2 text-xs text-stone-700">
                                     <span>已选 {selectedMsgIds.size} 条</span>
-                                    <div className="flex gap-2">
+                                    <div className="flex justify-center gap-3">
                                         <button
                                             onClick={(e) => { e.stopPropagation(); exitBatchMode(); }}
-                                            className="px-3 py-1 rounded-full bg-stone-200 text-stone-600"
+                                            className="min-h-[44px] min-w-[64px] px-4 py-2 rounded-full bg-stone-200 text-stone-600"
                                         >完成</button>
                                         <button
                                             onClick={(e) => { e.stopPropagation(); handleBatchDelete(); }}
                                             disabled={selectedMsgIds.size === 0}
-                                            className="px-3 py-1 rounded-full bg-red-500 text-white disabled:opacity-40"
+                                            className="min-h-[44px] min-w-[64px] px-4 py-2 rounded-full bg-red-500 text-white disabled:opacity-40"
                                         >删除</button>
                                     </div>
                                 </div>
@@ -1043,7 +1111,7 @@ const DateSession: React.FC<DateSessionProps> = ({
                                 return (
                                     <>
                                         {observeEnabled && hasObservation(peekObs) && (
-                                            <div className="max-w-md mx-auto mb-6"><ReadingObservation reading={decoratedReading} observation={peekObs} variant="card" charName={char.name} config={char.dateObserve} /></div>
+                                            <div className="max-w-md mx-auto mb-6"><ReadingObservation reading={decoratedReading} lightSurface={!!lightReading} observation={peekObs} variant="card" charName={char.name} config={char.dateObserve} /></div>
                                         )}
                                         <div className={`meeting-prose italic text-center text-sm mb-8 px-4 ${lightReading ? 'text-stone-400' : 'text-slate-200/50'}`}>
                                             {cleanTextForDisplay(peekBody).split('\n').map((line, idx) => line.trim() && <p key={idx} className="whitespace-pre-wrap leading-relaxed tracking-wide my-2">{line}</p>)}
@@ -1115,19 +1183,20 @@ const DateSession: React.FC<DateSessionProps> = ({
                                             )}
                                             <div className="min-w-0 flex-1">
                                                 {observeEnabled && hasObservation(msgObs) && (
-                                                    <ReadingObservation reading={decoratedReading} observation={msgObs} variant="card" charName={char.name} config={char.dateObserve} />
+                                                    <ReadingObservation reading={decoratedReading} lightSurface={!!lightReading} observation={msgObs} variant="card" charName={char.name} config={char.dateObserve} />
                                                 )}
-                                                {(msgBody || '').split('\n').map((line, idx) => {
+                                                {normalizeDateVoiceLines(msgBody || '').split('\n').map((line, idx) => {
                                                 const cleanLine = cleanTextForDisplay(line);
                                                 if (!cleanLine) return null;
                                                 const lineIsDialogue = isDialogueLine(line);
                                                 const lineKey = `${msg.id}-${idx}`;
                                                 const isOpeningMsg = msg.metadata?.isOpening === true;
                                                 const parsedVoiceLine = extractVoiceEmotionTag(line);
-                                                const dialogueText = extractDialogueText(parsedVoiceLine.rest);
+                                                const dialogueText = speechTextForLine(parsedVoiceLine.rest);
                                                 const voiceTarget: DateVoiceFavoriteTarget = {
                                                     sourceKey: `${char.id}:${lineKey}`,
-                                                    originalText: dialogueText,
+                                                    originalText: extractDialogueText(parsedVoiceLine.rest),
+                                                    speechText: dialogueText,
                                                     sourceTimestamp: msg.timestamp,
                                                     voiceEmotion: parsedVoiceLine.voiceEmotion,
                                                 };
@@ -1249,7 +1318,7 @@ const DateSession: React.FC<DateSessionProps> = ({
                                     </div>
                                 )}
                                 <p className="text-white/90 text-[16px] leading-relaxed font-light tracking-wide drop-shadow-md mt-2 whitespace-pre-wrap" data-sar-gal-text>
-                                    {galShownText === currentText ? displayedText : galShownText}
+                                    {galShownText === currentText ? displayedText : displayTextForLine(galShownText)}
                                     {isTextAnimating && galShownText === currentText && <span className="inline-block w-2 h-4 bg-white/70 ml-1 animate-pulse align-middle"></span>}
                                 </p>
                                 {!isTextAnimating && dialogueQueue.length > 0 && <div className="absolute bottom-3 right-4 animate-bounce opacity-70"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-white"><path fillRule="evenodd" d="M12.53 16.28a.75.75 0 0 1-1.06 0l-7.5-7.5a.75.75 0 0 1 1.06-1.06L12 14.69l6.97-6.97a.75.75 0 1 1 1.06 1.06l-7.5 7.5Z" clipRule="evenodd" /></svg></div>}
@@ -1290,9 +1359,10 @@ const DateSession: React.FC<DateSessionProps> = ({
                 )}
             </div>
 
-            {/* Settings Overlay */}
+            {/* Settings measures its visible height on mount. A translateY entrance
+                animation here would measure the offscreen position and lock it at 0. */}
             {showSettings && (
-                <div className="absolute inset-0 z-[200] animate-slide-up bg-white">
+                <div className="absolute inset-0 z-[200] bg-white text-slate-800">
                     <DateSettings char={char} onBack={() => setShowSettings(false)} />
                 </div>
             )}
@@ -1337,5 +1407,5 @@ const DateSession: React.FC<DateSessionProps> = ({
 export default DateSession;
 
 function ReadingObservation({reading,...props}: React.ComponentProps<typeof ObserveHUD> & {reading:boolean}) {
-    return reading ? <details className="mb-4 text-xs text-slate-500"><summary className="cursor-pointer py-2">场景信息</summary><ObserveHUD {...props}/></details> : <ObserveHUD {...props}/>;
+    return reading ? <details className="mb-4 text-xs" style={{ color: 'var(--meeting-muted, #64748b)' }}><summary className="cursor-pointer py-2">场景信息</summary><ObserveHUD {...props}/></details> : <ObserveHUD {...props}/>;
 }

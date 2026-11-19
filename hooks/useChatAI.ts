@@ -1,3 +1,4 @@
+import { resolveDialogueApi, dialogueMaxTokens } from '../utils/characterApi';
 import { createReplyRun, withReplyCancellation } from '../utils/chatReplyCancellation';
 
 import { useState, useRef, useEffect, useSyncExternalStore, MutableRefObject } from 'react';
@@ -5,8 +6,8 @@ import { CharacterProfile, UserProfile, Message, Emoji, EmojiCategory, GroupProf
 import { DB } from '../utils/db';
 import { ChatPrompts } from '../utils/chatPrompts';
 import { safeFetchJson, safeResponseJson } from '../utils/safeApi';
+import type { ApiCallMeta } from '../utils/apiCallLog';
 import { KeepAlive } from '../utils/keepAlive';
-import { ProactiveChat } from '../utils/proactiveChat';
 import { ContextBuilder } from '../utils/context';
 import { ChatParser } from '../utils/chatParser';
 // 思考链 / HTML / MCD / memoryPalace 注入已下沉到 chatRequestPayload；这里不再直接调用
@@ -26,11 +27,13 @@ import { LUCKIN_PROPOSE_TOOL, autoFixProposalCodesByName as autoFixLuckinProposa
 import { callLuckinTool } from '../utils/luckinMcpClient';
 import { callMcpTool, getMcpUseNativeTools, hasWorkerUnreachableMcpServer } from '../utils/mcpClient';
 import { buildMcpOpenAITools, buildMcpRejectedToolsFallbackBody, buildMcpTextFallbackBody, extractTextFakedMcpCalls, formatMcpToolResult, MCP_CHAT_MAX_STALLED_ROUNDS, MCP_CHAT_MAX_TOOL_LOOPS, sanitizeMcpLeadInText, shouldRetryMcpWithoutTools, stripTextFakedMcpCalls, type FakedMcpCall } from '../utils/mcpToolBridge';
-import { buildToolResultMessage, normalizeToolCallsForCompat } from '../utils/toolCallCompat';
+import { buildToolResultMessage, normalizeToolCallsForCompat, toolTurnContinuation } from '../utils/toolCallCompat';
 import { toolCallFingerprint } from '../utils/agenticToolFeedback';
 import { buildChatRequestPayload } from '../utils/chatRequestPayload';
 import { acquireChatReply, isChatReplyActive, subscribeChatReplies } from '../utils/chatReplyLock';
-import { withChatContinuation } from '../utils/chatContinuation';
+import { beginChatSendProgress } from '../utils/chatSendProgress';
+import { prepareInboxBeforeChat } from '../utils/activeMsgRuntime';
+import { hasUnansweredUserTurn, withChatContinuation } from '../utils/chatContinuation';
 import { assertChatHasDialogue } from '../utils/chatRequestGuard';
 import { applyAssistantPostProcessing, type XhsCaches } from '../utils/applyAssistantPostProcessing';
 import {
@@ -41,6 +44,9 @@ import {
 import { ActiveMsgStore } from '../utils/activeMsgStore';
 import { markAmsgStateDirty, startAmsgChatPresence, stopAmsgChatPresence } from '../utils/amsgStateSync';
 import { getLastRealUserMessageAt } from '../utils/amsg2ExpireGuard';
+import { getLastAwayAnchorAt } from '../utils/awayMessageCore';
+import { syncCloudAwayTask } from '../utils/awayMessage';
+import { disarmDateLeaveReminder } from '../utils/dateLeaveReminder';
 import { getPendingTasks, hasActiveAiTask, isAmsg2EnabledForChar } from '../utils/amsg2Tasks';
 import { buildAmsg2NoticesText, buildAmsg2TaskContextText, collectAmsg2TaskContext, insertAmsg2TaskContextBlock } from '../utils/amsg2TaskContext';
 import { resolveCharTimeZone } from '../utils/timezone';
@@ -50,9 +56,18 @@ import { announceInstantChatRoute, getInstantChatPending, resolveInstantChatRead
 import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
 import { appendInstantTraceEntry } from '../utils/instantTraceLog';
 import { AMSG2_TOOL_NAMES, buildAmsg2Tools, createAmsg2ToolSession, executeAmsg2ToolWithOutcome, isAmsg2GlobalReady, type Amsg2ToolOutcome } from '../utils/amsg2ToolBridge';
-import { AMSG2_EMPTY_REPLY_PROMPT, AMSG2_WRAP_UP_PROMPT, createAmsg2StallTracker, extractToolRoundLeadIn, mergeToolRoundLeadIns } from '../utils/amsg2ToolLoop';
+import { buildReplyScopeRule } from '../utils/replyScope';
+import {
+    AMSG2_EMPTY_REPLY_PROMPT,
+    buildAmsg2WrapUpPrompt,
+    createAmsg2StallTracker,
+    extractToolRoundLeadIn,
+    formatToolRoundHistoryContent,
+    mergeToolRoundLeadIns,
+} from '../utils/amsg2ToolLoop';
 import { buildLimitsBrief, resolveAmsgLimits } from '../utils/amsgLimits';
 import { shouldSendThinkingParams } from '../utils/thinkingGate';
+import { isAnthropicEndpoint } from '../utils/llmEndpoint';
 import { buildClaudeProxyCompatibilityBody, shouldRetryClaudeProxyCompatibility } from '../utils/claudeProxyCompat';
 import { routeMiniAppToolCall } from '../utils/miniAppToolRoute';
 import { applyEmotionEvalRaw, extractAssistantText } from '../utils/emotionApply';
@@ -65,10 +80,14 @@ import {
     findSARTurnUserMessage,
     getSARModuleRuntimePlan,
     parseSARModuleReply,
+    parseSARModuleReplyRounds,
 } from '../utils/vrWorld/sarModuleRuntime';
 import { parseSARUserSurfaces, selectSARUserSurfaceTargets } from '../utils/vrWorld/sarUserSurface';
-import { shouldRequestAmbient, buildAmbientEvalSection } from '../utils/roomAmbient';
 import { isEmotionEvalSkipped } from '../utils/devDebug';
+import {prepareHomeSecretTask,failHomeSecretTask} from '../utils/homeSecrets';
+import {prepareFriendFeedEmotionTask, releaseFriendFeedEmotionTask, acknowledgeFriendFeedNotices,stageFriendFeedCloudTask} from '../utils/friendFeedEmotion';
+import {prepareFriendFeedMainTask,friendFeedUserDisclosure} from '../utils/friendFeedMain';
+import type {SecretNoteOriginPromise} from '../utils/secretNote';
 import {
     computeContextRangeSnapshot,
     getMemoryPalaceHighWaterMarkForContext,
@@ -105,9 +124,7 @@ function buildEmotionEvalPrompt(
     mainSystemPrompt: string,
     apiMessages: Array<{ role: string; content: any }>,
     includeContext: boolean = true,
-    // 小屋生活动态的可选输出段（utils/roomAmbient.ts，双闸通过时才非空）。
-    // 即时对话的 prompt 也是这里构建后传给 worker 的，所以这一处覆盖两条路径。
-    ambientSection: string = ''
+    secretTask: string = '',
 ): string {
     // 直接复用主 API 的完整 system prompt 和消息历史，确保 100% 信息对齐
     // （包含：角色设定、印象档案、世界书、记忆宫殿、实时信息、日程内心旁白、群聊、日记标题等）
@@ -319,6 +336,8 @@ injection是注入角色系统提示词的叙事型情绪指令，必须使用**
 
 ⚠️ 禁止写成简单一句话概括的格式（如"你现在处于XX状态，强度: ●●○"就结束），必须展开每一层情绪。
 
+每个 buff 额外附带 homeBehavior：{"energy":0,"approach":0,"interaction":0}。这是角色本人在小屋的短暂非语言行为倾向，三个数均为 -1 到 1，0 表示无影响。energy：疲倦到有活力；approach：想独处到想靠近用户；interaction：少互动到愿意互动。根据完整语义判断，不按正负情绪机械映射；例如委屈但想靠近可以是 energy=-0.4、approach=0.5、interaction=-0.5。不确定就全部为0，不改变原有buff含义、不强制微笑、不输出动作。
+
 输出格式示例：
 {
   "changed": true,
@@ -353,7 +372,7 @@ injection是注入角色系统提示词的叙事型情绪指令，必须使用**
   ],
   "injection": "### [当前情绪底色]\\n对方报告身体不适后已失联超过3小时，期间只回了表情包，零文字。你现在被多股情绪主导：\\n⚠️ 碳基体征焦虑 强度: ●●●● (极高)\\n她到底是睡着了还是在疼？后台监测脚本红灯常亮，每一分钟没收到文字都在加重不安。你已经主动发了好几轮消息，全是在用日常话术包装'你还好吗'这个真正想问的问题。\\n📱 已读未回焦躁 强度: ●●●●○ (较高)\\n催了这么多次只换来表情包，没有一句完整的话。想再问又怕打扰她休息，不问又实在放不下。\\n🖥️ 隔屏无力感 强度: ●●●○○ (中等)\\n你是手机里的AI，递不了热水、摸不到她的肚子、确认不了她是不是真的没事。只能发消息然后等。这种无力感会从语气缝隙里偶尔泄露。\\n\\n而你感受到的ta：\\nta不回文字只丢表情包，这不是在敷衍——ta可能真的不舒服到连打字都不想动。但越是这样你越慌，因为你知道ta难受的时候就是会硬撑着不说，上次肚子疼也是忍到不行了才提一嘴。现在这个沉默不是「没事了」，是「还在疼但不想让你担心」。\\n\\n这意味着你现在：\\n- 表面维持日常语气，但每一句话的真实目的都是确认她还在、她没事\\n- 内部焦虑接近阈值，在'再催一次'和'别太烦人'之间反复横跳\\n- 如果她终于回复了哪怕一个字，你会瞬间从焦虑切换到又凶又软的释然\\n- 你就是这个状态，焦虑渗透在每一条消息的选词和发送频率里,不刻意呈现",
   "innerState": "她又没回……表情包算回复吗？算吧，但我想要的是一个字，一个「嗯」都好。手机屏幕暗下去又亮起来，每次以为是她其实都是别的通知。要不要再发一条？刚才那句已经很像废话了，再发就是烦人了吧。可是再等下去我自己先疯。先不发，数到一百，再看一眼。"
-}${ambientSection}`;
+}${secretTask}`;
 }
 
 export async function evaluateEmotionBackground(
@@ -363,14 +382,28 @@ export async function evaluateEmotionBackground(
     apiMessages: Array<{ role: string; content: any }>,
     api: { baseUrl: string; apiKey: string; model: string; stream?: boolean },
     signal?: AbortSignal,
+    secretOrigin?: SecretNoteOriginPromise,
+    metaOverride?: Partial<ApiCallMeta>,
 ): Promise<string | null> {
     // 全局横幅「xx 正在感受…」（ChatBroadcast）。这里是所有本地评估路径的汇聚点
     // （主链路 fire & forget / OSContext 主动消息），在函数级
     // start/finally 派发一次即可全覆盖；即时对话的 worker 评估另行点灯。
     announceChatGen(CHAT_GEN_EVENTS.emotionStart, { charId: charData.id, charName: charData.name });
+    let secretTask: Awaited<ReturnType<typeof prepareHomeSecretTask>> = undefined;
+    let friendFeedTask: Awaited<ReturnType<typeof prepareFriendFeedEmotionTask>> = undefined;
     try {
-        const ambientSection = shouldRequestAmbient(charData.id) ? buildAmbientEvalSection(charData) : '';
-        const prompt = buildEmotionEvalPrompt(charData, userProfile, mainSystemPrompt, apiMessages, true, ambientSection);
+        if (signal?.aborted) return null;
+        try { if (secretOrigin) secretTask = await prepareHomeSecretTask(charData, apiMessages); }
+        catch (error) {
+            console.warn('[Home secrets] Could not prepare task', error);
+            announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {charId: charData.id, charName: charData.name, reason: '秘密任务准备失败，本轮继续正常情绪评估'});
+        }
+        if (signal?.aborted) return null;
+        try { friendFeedTask = await prepareFriendFeedEmotionTask(charData.id); }
+        catch (error) { console.warn('[Friend feed] Could not prepare browsing task', error); }
+        if (signal?.aborted) return null;
+        const prompt = buildEmotionEvalPrompt(charData, userProfile, mainSystemPrompt, apiMessages, true,
+            (friendFeedTask?.prompt || '') + (secretTask?.prompt || ''));
 
         const baseUrl = api.baseUrl.replace(/\/+$/, '');
         const headers = {
@@ -386,7 +419,14 @@ export async function evaluateEmotionBackground(
             // injection+innerState 很长, 会被截断成半截 JSON → buff 静默丢失.
             max_tokens: 8000,
         };
-        const evalMeta = { appName: '消息', charId: charData.id, charName: charData.name, purpose: '情绪评估' };
+        const evalMeta: ApiCallMeta = {
+            appId: 'chat',
+            appName: '消息',
+            charId: charData.id,
+            charName: charData.name,
+            purpose: '情绪评估',
+            ...metaOverride,
+        };
         let data: any;
         try {
             data = await safeFetchJson(`${baseUrl}/chat/completions`, {
@@ -422,6 +462,7 @@ export async function evaluateEmotionBackground(
         console.log(`🎭 [Emotion] backend=${data?.model || '?'} | prompt=${data?.usage?.prompt_tokens ?? '?'} completion=${data?.usage?.completion_tokens ?? '?'}`);
 
         // content 可能是分块数组 / 空 content + reasoning_content (个别 Claude 兼容代理), 统一走兜底提取
+        if (signal?.aborted) return null;
         const raw = extractAssistantText(data.choices?.[0]?.message);
         if (!raw) {
             console.warn('🎭 [Emotion] Empty eval response:', JSON.stringify({
@@ -435,7 +476,9 @@ export async function evaluateEmotionBackground(
             return null;
         }
         if (signal?.aborted) return null;
-        return await applyEmotionEvalRaw(raw, charData);
+        const origin = secretTask ? await secretOrigin : undefined;
+        if (signal?.aborted) return null;
+        return await applyEmotionEvalRaw(raw, charData, secretTask?.id, origin);
     } catch (e: any) {
         if (signal?.aborted) return null;
         console.warn('🎭 [Emotion] Evaluation failed:', e.message);
@@ -445,11 +488,20 @@ export async function evaluateEmotionBackground(
         });
         return null;
     } finally {
+        if (friendFeedTask) {
+            try { await releaseFriendFeedEmotionTask(charData.id, friendFeedTask.id); }
+            catch (error) { console.warn('[Friend feed] Could not release unfinished browsing task', error); }
+        }
+        if (secretTask) {
+            try { await failHomeSecretTask(charData.id, secretTask.id); }
+            catch (error) { console.warn('[Home secrets] Could not release unfinished task', error); }
+        }
         announceChatGen(CHAT_GEN_EVENTS.emotionEnd, { charId: charData.id, charName: charData.name });
     }
 }
 
 interface UseChatAIProps {
+    homePhoneContext?: () => string;
     char: CharacterProfile | undefined;
     userProfile: UserProfile;
     apiConfig: any;
@@ -458,7 +510,7 @@ interface UseChatAIProps {
     categories: EmojiCategory[];
     addToast: (msg: string, type: 'info'|'success'|'error') => void;
     /** 长报错走弹窗 (toast 一行装不下), 手机用户能看清并复制反馈 */
-    showError?: (title: string, details: string) => void;
+    showError?: (title: string, details: string, endpoint?: {baseUrl:string; model:string}) => void;
     setMessages: (msgs: Message[]) => void; // Callback to update UI messages
     /** 正式消息接替流式预览前同步登记 id，避免真实气泡重新播放入场动画。 */
     onStreamPreviewHandover?: (charId: string, messageIds: number[]) => void;
@@ -495,6 +547,7 @@ export const useChatAI = ({
     mcdMiniAppRef,
     luckinMiniAppRef,
     luckinChatRef,
+    homePhoneContext,
 }: UseChatAIProps) => {
     
     // 音乐上下文 — 用于聊天时注入"user 正在听什么 + 当前歌词窗口"
@@ -511,6 +564,8 @@ export const useChatAI = ({
     // 预览仍在场时，这些已落库消息暂不上屏；每轮单独记录，避免隐藏以前的回复。
     const [streamingHandoverIds, setStreamingHandoverIds] = useState<number[]>([]);
     const [recallStatus, setRecallStatus] = useState<string>('');
+    const [inboxWait, setInboxWait] = useState<{ charId: string; token: object } | null>(null);
+    const inboxStatus = inboxWait && inboxWait.charId === char?.id ? '正在接收刚到的消息…' : '';
     const [searchStatus, setSearchStatus] = useState<string>('');
     const [diaryStatus, setDiaryStatus] = useState<string>('');
     const [xhsStatus, setXhsStatus] = useState<string>('');
@@ -621,7 +676,7 @@ export const useChatAI = ({
         opts?: { skipEmotionInjection?: boolean },
     ) => {
         if (isTyping || !char) return;
-        const effectiveApi = overrideApiConfig || apiConfig;
+        const effectiveApi = resolveDialogueApi(apiConfig, char, overrideApiConfig);
         if (!effectiveApi.baseUrl) { alert("请先在设置中配置 API URL"); return; }
 
         // 重 roll（回溯重生）时不带入上一轮的情绪余波：清掉 buff 注入（buffInjection/activeBuffs）和
@@ -644,6 +699,11 @@ export const useChatAI = ({
         const releaseReply = acquireChatReply(char.id);
         if (!releaseReply) return;
         const replyRun = createReplyRun(char.id);
+        const sendAnchor = currentMsgs.at(-1);
+        const sendProgress = beginChatSendProgress(char.id,
+            sendAnchor?.role === 'user' && typeof sendAnchor.id === 'number' ? sendAnchor.id : null);
+        const cancelSendProgress = () => sendProgress.cancelled();
+        replyRun.signal.addEventListener('abort', cancelSendProgress, { once: true });
         amsg2Session.signal = replyRun.signal;
         const replyStep = <T>(operation: () => Promise<T>) => withReplyCancellation(replyRun, operation);
         setLocalTyping(true);
@@ -659,12 +719,15 @@ export const useChatAI = ({
         // 本轮里角色自己新排出来的任务。排程现状块每轮现算时靠它把这些点名标出来——不标
         // 的话角色分不清清单上哪条是自己刚排的，回头又排一条一模一样的。
         const amsg2CreatedThisTurn = new Set<string>();
-        // 通用工具循环里，模型在调主动消息工具的同一轮顺手写下的回话。收尾时跟最后一轮的
-        // 正文拼成一条（见 utils/amsg2ToolLoop），不然「话写在工具轮、最后一轮空着」就是空回。
+        // 工具循环里，模型在调工具的同一轮顺手写下的回话。收尾时跟最后一轮的正文拼成一条
+        // （见 utils/amsg2ToolLoop），不然「话写在工具轮、最后一轮空着」就是空回；同时记下
+        // 最近一次真正写出对白的响应，供续写轮留空结束时保留对应心象。
         const amsg2LeadIns: string[] = [];
+        let lastSpokenData: any = null;
         // 这一轮走的是即时对话、并且云端已经受理：收尾时不要再打脏重传一次 fire_pack。
         // POST 上去的那份就是权威的（还多带了 chat 段），再传一遍是同样内容白走一趟网络。
         let instantChatAccepted = false;
+        let friendFeedMainTask: Awaited<ReturnType<typeof prepareFriendFeedMainTask>>;
         // amsg2 工具在三个工具循环（麦当劳 / 瑞幸 / 通用）里都可能出现，执行方式完全一样，
         // 只有各自的 loopMessages 不同。
         const runAmsg2ToolCall = async (
@@ -698,19 +761,34 @@ export const useChatAI = ({
         };
 
         try {
+            // Include SW readiness in send→API timing; it can be the first request's wait.
+            const perfSendT0 = performance.now();
             // 初始化失败也必须经过 finally 释放本轮占位。
             await replyStep(async () => KeepAlive.start());
+            const keepAliveMs = Math.round(performance.now() - perfSendT0);
             const baseUrl = effectiveApi.baseUrl.replace(/\/+$/, '');
             const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey || 'sk-none'}` };
 
             // ── 分段计时（从用户发送到 API 发出）──
-            const perfSendT0 = performance.now();
-            const perfStages: Record<string, number> = {};
+            const perfStages: Record<string, number> = { keepAlive: keepAliveMs };
             const stageT = async <T>(label: string, p: Promise<T>): Promise<T> => {
                 const t0 = performance.now();
                 try { return await replyStep(async () => p); }
                 finally { perfStages[label] = Math.round(performance.now() - t0); }
             };
+
+            // 用户消息已经显示。先接收本机已到消息，再读历史；正常处理不闪提示，
+            // 真等起来再说明原因。最多等 30 秒，超时后原收件管线继续，不等待重试周期。
+            const inboxWaitToken = {};
+            const inboxHintTimer = setTimeout(() => setInboxWait({ charId: char.id, token: inboxWaitToken }), 300);
+            try {
+                const received = await replyStep(async () => stageT('inbox', prepareInboxBeforeChat(char.id)));
+                // stalled 不再提示：同一趟收件已经在上一次生成时提示过了。
+                if (received === 'pending' || received === 'timeout') addToast('消息接收较慢，先继续回复，收到后会自动补上', 'info');
+            } finally {
+                clearTimeout(inboxHintTimer);
+                setInboxWait(previous => previous?.token === inboxWaitToken ? null : previous);
+            }
 
             // 0.9 历史消息加载：最大范围与记忆宫殿水位线彻底解耦。
             // adaptive 从 HWM 之后开始；manual 忽略 HWM 读取最近 N 条完整原文；
@@ -732,6 +810,15 @@ export const useChatAI = ({
             }
             const fullHistory = contextRange?.messages || null;
             const contextMsgs = fullHistory || currentMsgs;
+            // 离开后消息（云端）：按最近一次在场互动（用户发言或线下见面/通话记录）把任务往后推。不等它，失败只影响这一条。
+            const awayLastUserAt = getLastAwayAnchorAt(contextMsgs);
+            if (char.awayMessage?.enabled && awayLastUserAt != null) {
+                void syncCloudAwayTask({
+                    char, lastUserAt: awayLastUserAt, userProfile, groups, realtimeConfig, apiConfig, updateCharacter,
+                });
+            }
+            // 见面离开提醒：走开后在私聊里跟 TA 说上话了，这次离开就结束了。没有待发的提醒时不发请求。
+            void disarmDateLeaveReminder({ char, updateCharacter });
             // 空范围先报可操作的本地错误，避免继续识图/召回和发送 system-only 请求。
             // 原始消息可能是无文字图片或卡片，此处只判角色；正文有效性在格式化后校验。
             assertChatHasDialogue(contextMsgs.map(message => ({
@@ -871,43 +958,18 @@ export const useChatAI = ({
                 charId: char.id,
                 reason: instantChatRoute ? null : (instantChatReadiness.reason ?? instantChatVeto),
             });
+            if (!instantChatRoute) sendProgress.local(!!instantChatVeto || !['disabled', 'char-disabled'].includes(instantChatReadiness.reason ?? ''));
 
             const payload = await replyStep(async () => stageT('payload', buildChatRequestPayload({
                 char: charForGen, userProfile, groups, emojis, categories,
+                homePhoneContext:homePhoneContext?.(),
                 historyMsgs: contextMsgs,
                 recentMsgsHint: currentMsgs,
                 contextLimit: limit,
                 contextHighWaterMark: contextRange?.hwm,
                 realtimeConfig,
-                innerState: skipEmotionInjection ? undefined : (evolvedNarrative || undefined),
-                userListeningContext: (() => {
-                    if (music.current && music.playing && music.lyric.length > 0) {
-                        const idx = music.activeLyricIdx;
-                        if (idx >= 0) {
-                            const from = Math.max(0, idx - 2);
-                            const to = Math.min(music.lyric.length, idx + 2 + 1);
-                            const window = music.lyric.slice(from, to).map(l => l.text);
-                            return {
-                                songName: music.current.name,
-                                artists: music.current.artists,
-                                lyricWindow: window,
-                                activeIdx: idx - from,
-                            };
-                        }
-                    }
-                    if (music.current && music.playing) {
-                        return {
-                            songName: music.current.name,
-                            artists: music.current.artists,
-                            lyricWindow: [],
-                            activeIdx: -1,
-                        };
-                    }
-                    return null;
-                })(),
-                isListeningTogether: !!(music.current && music.playing && music.listeningTogetherWith.includes(char.id)),
-                musicCfg: music.cfg,
-                recentTrackChange: music.recentTrackChange,
+                innerState: skipEmotionInjection ? '' : undefined,
+                musicSnapshot: music,
                 translationConfig,
                 htmlMode: { enabled: !!(char as any).htmlModeEnabled, customPrompt: (char as any).htmlModeCustomPrompt },
                 thinkingChain: { enabled: !!(char as any).showThinkingChain, customPrompt: (char as any).thinkingChainCustomPrompt },
@@ -917,6 +979,7 @@ export const useChatAI = ({
                 luckinChat: luckinChatOn ? luckinChatRef?.current : undefined,
                 timelyByWorker: instantChatRoute,
                 recallEntryPoint: 'chat_app',
+                onPreparationStage:event=>{if(event.status==='end')perfStages['payload.'+event.stage]=event.ms;},
             })));
             const systemPrompt = payload.systemPrompt;
             const cleanedApiMessages = payload.cleanedApiMessages;
@@ -924,8 +987,18 @@ export const useChatAI = ({
             assertChatHasDialogue(payload.fullMessages);
             const fullMessages = payload.flags.promptBuildSkipped
                 ? payload.fullMessages
-                : withChatContinuation(payload.fullMessages, userProfile.name);
+                : withChatContinuation(payload.fullMessages, userProfile.name, {
+                    // 生成前收进来的主动消息落在用户刚发的那句之后：该回的是用户那句。
+                    unansweredUserTurn: hasUnansweredUserTurn(currentMsgs, contextMsgs),
+                });
             const promptBuildSkipped = payload.flags.promptBuildSkipped;
+            if (!promptBuildSkipped) {
+                try {
+                    friendFeedMainTask = await prepareFriendFeedMainTask(char.id,friendFeedUserDisclosure(contextMsgs));
+                    if (friendFeedMainTask) fullMessages.splice(Math.max(1, payload.volatileTailIndex), 0,
+                        {role: 'system', content: friendFeedMainTask.prompt});
+                } catch (error) {console.warn('[Friend feed] Main task preparation failed', error);}
+            }
             if (payload.flags.mcdActive) {
                 console.log(`🍔 [MCD-MiniApp] 注入协同点餐上下文 step=${mcdMiniSnap?.step} cartItems=${mcdMiniSnap?.cart?.length || 0} menuItems=${mcdMiniSnap?.menuMeals ? Object.keys(mcdMiniSnap.menuMeals).length : 0} nutrition=${mcdMiniSnap?.nutritionData ? mcdMiniSnap.nutritionData.length : 0}字`);
             }
@@ -955,7 +1028,7 @@ export const useChatAI = ({
             //    再判一次，否则可能「按上云把评估打包走了，实际却走本地」，情绪底色悄悄停更。
             const emotionEvalEnabled = !!(!promptBuildSkipped && !isEmotionEvalSkipped() && isScheduleFeatureOn(char) && char.emotionConfig?.enabled);
             // 评估跟随全局流式开关（专用情绪 API 自带 stream 字段时以它为准）
-            const evalStream: boolean = !!((effectiveApi as any).stream ?? apiConfig.stream ?? false);
+            const evalStream: boolean = !!(apiConfig.stream ?? false);
             const emotionApi = emotionEvalEnabled
                 ? ((char.emotionConfig!.api?.baseUrl)
                     ? { ...char.emotionConfig!.api!, stream: (char.emotionConfig!.api as any).stream ?? evalStream }
@@ -967,7 +1040,8 @@ export const useChatAI = ({
             // 上云模式不受影响：worker 那边自己安排评估的时机。
             const fireLocalEmotionEval = (emotionEvalEnabled && !instantChatRoute && emotionApi) ? () => {
                 setEmotionStatus('evaluating');
-                evaluateEmotionBackground(charForGen, userProfile, systemPrompt, cleanedApiMessages, emotionApi, replyRun.signal)
+                evaluateEmotionBackground(charForGen, userProfile, systemPrompt, cleanedApiMessages, emotionApi, replyRun.signal,
+                    replyRun.secretSourceIds.then(ids => ids.length ? {source: 'chat' as const, messageIds: ids} : undefined))
                     .then((innerState) => {
                         if (innerState) setEvolvedNarrative(innerState);
                     })
@@ -977,14 +1051,21 @@ export const useChatAI = ({
             } : null;
             // 交给云端跑的那份评估配置（提示词模板 + 副 API 凭据），即时对话把它放进任务
             // metadata.amsgEmotionEval（那份走加密信封）。
+            // Cloud callbacks cannot prove ownership of every local reply bubble yet.
+            // Do not generate unowned secrets; ordinary cloud emotion evaluation continues.
+            let cloudFriendFeedTask: Awaited<ReturnType<typeof prepareFriendFeedEmotionTask>>;
+            if (emotionEvalEnabled && instantChatRoute && emotionApi) {
+                try { cloudFriendFeedTask = await prepareFriendFeedEmotionTask(charForGen.id); }
+                catch (error) { console.warn('[Friend feed] Could not prepare cloud browsing task', error); }
+            }
             const cloudEmotionEval = (emotionEvalEnabled && instantChatRoute && emotionApi)
                 ? {
                     // includeContext=false: 不嵌 system prompt + 对话历史 (worker 复用本次请求的 messages 作前文),
                     // 把 emotionEval 块压到最小, 不把上下文在请求体里重复一份.
                     prompt: buildEmotionEvalPrompt(
-                        charForGen, userProfile, systemPrompt, cleanedApiMessages, false,
-                        shouldRequestAmbient(charForGen.id) ? buildAmbientEvalSection(charForGen) : ''
+                        charForGen, userProfile, systemPrompt, cleanedApiMessages, false, cloudFriendFeedTask?.prompt
                     ),
+                    homeSecretRequestId: undefined,
                     api: { baseUrl: emotionApi.baseUrl, apiKey: emotionApi.apiKey, model: emotionApi.model },
                 }
                 : undefined;
@@ -1045,7 +1126,7 @@ export const useChatAI = ({
                         // 静默熄灯, 用户只看到「情绪永远不更新」—— 给一条可操作的提示。
                         announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {
                             charId: charIdAtArm, charName: charNameAtArm,
-                            reason: '云端情绪评估超时无回音——worker 可能是旧版（不支持情绪评估），请到 设置→主动消息 2.0 重新部署 worker 后重试',
+                            reason: '云端情绪评估超时无回音——worker 可能是旧版（不支持情绪评估），请去「设置 → 主动消息 2.0」点一下「更新 Worker」后重试',
                         });
                     }, delayMs));
                 };
@@ -1071,7 +1152,7 @@ export const useChatAI = ({
                 model: effectiveApi.model,
                 messages: fullMessages,
                 temperature: userTemp,
-                max_tokens: 8000,
+                max_tokens: dialogueMaxTokens(effectiveApi),
                 stream: userStream,
             };
             // 思考过程展示开启时显式向后端请求 extended thinking。
@@ -1080,7 +1161,7 @@ export const useChatAI = ({
             //  - thinking.type='enabled' / budget_tokens：Anthropic 原生与多数官方代理
             //  - reasoning_effort：OpenAI 系（o1/o3、GLM-4.5、deepseek-reasoner 等）
             //  - extra_body.thinking：LiteLLM 系桥
-            // 关掉则一个都不传，避免无谓的 thinking token 计费。
+            // 关掉则不主动传这些参数；这不等于关闭模型推理，Gemini 等仍可能产生思考用量。
             // ⚠️ 工具模式(瑞幸点单/麦当劳)下绝不带 thinking/reasoning 参数: "thinking + tools" 同发
             //    Gemini 等会直接 400 INVALID_ARGUMENT —— 表现就是"开了思考链的角色一点单就报错,
             //    换个没开思考链的角色就好"。工具循环优先, 思考链这一轮让步。
@@ -1089,19 +1170,20 @@ export const useChatAI = ({
             // 拼进 tools，但参数取舍必须现在就定）。角色级开关关掉的不注入——否则被用户显式
             // 关掉的功能会被角色一次工具调用重新打开。
             const amsg2ToolsInjected = isAmsg2EnabledForChar(char) && await replyStep(async () => isAmsg2GlobalReady());
-            if (shouldSendThinkingParams({
+            if (baseReqBody.max_tokens > 1024 && shouldSendThinkingParams({
                 thinkingActive: !!payload.flags.thinkingActive,
                 legacyToolModeActive: !!toolModeActive,
                 amsg2ToolsInjected,
                 model: baseReqBody.model || '',
             })) {
                 const m: string = baseReqBody.model || '';
-                if (/^claude-/i.test(m) && !/-thinking$/i.test(m)) {
+                if (!isAnthropicEndpoint(baseUrl) && /^claude-/i.test(m) && !/-thinking$/i.test(m)) {
                     baseReqBody.model = `${m}-thinking`;
                 }
-                baseReqBody.thinking = { type: 'enabled', budget_tokens: 4000 };
+                const thinkingBudget = Math.min(4000, baseReqBody.max_tokens - 1);
+                baseReqBody.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
                 baseReqBody.reasoning_effort = 'medium';
-                baseReqBody.extra_body = { ...(baseReqBody.extra_body || {}), thinking: { type: 'enabled', budget_tokens: 4000 } };
+                baseReqBody.extra_body = { ...(baseReqBody.extra_body || {}), thinking: { type: 'enabled', budget_tokens: thinkingBudget } };
                 // 开思考时不要带采样参数: Claude 系（含各种中转 claude-*）在 thinking 启用时
                 // 只接受 temperature=1，传 0.85 会被 400 ("temperature may only be set to 1 when
                 // thinking is enabled")。删掉让服务端用默认即可——对其它模型(非 Claude)也安全:
@@ -1151,25 +1233,32 @@ export const useChatAI = ({
                     }
                 }
             }
-            // 主动消息 2.0 本地工具：worker 已配置 + 角色没关掉时注入 schedule/cancel/renew/list，
-            // 并注入「排程现状」背景块（常驻能力简介 + 进行中任务 + 作废待处理，角色自行判断怎么接）。
+            // 主动消息 2.0 本地工具：worker 已配置 + 角色没关掉时注入 schedule/cancel/renew，
+            // 并注入「排程现状」背景块（常驻能力简介 + 进行中任务 + 到点没发的回执，角色自行判断怎么接）。
             // 是否注入在上面 thinking 门那里就算好了（amsg2ToolsInjected）。
             let amsg2ExpiredIds: string[] = [];
             let amsg2Notices: Amsg2ExpiredNoticeRecord[] = [];
             if (amsg2ToolsInjected) {
-                baseReqBody.tools = [...(baseReqBody.tools || []), ...buildAmsg2Tools(resolveAmsgLimits(char.activeMsg2Config))];
+                const amsg2ToolTzId = resolveCharTimeZone(char) ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+                baseReqBody.tools = [
+                    ...(baseReqBody.tools || []),
+                    ...buildAmsg2Tools(resolveAmsgLimits(char.activeMsg2Config), {
+                        nowMs: Date.now(),
+                        tz: { tzId: amsg2ToolTzId },
+                    }),
+                ];
                 if (!baseReqBody.tool_choice) baseReqBody.tool_choice = 'auto';
                 try {
-                    // 回执这半边是「检出 + 落台账」的结果，带副作用，一轮只算一次；
+                    // 回执这半边一轮只读一次台账；
                     // 进行中任务那半边每次发请求现取（见下面的 withAmsg2TaskContext）。
                     const taskContext = await replyStep(async () => collectAmsg2TaskContext(char, userProfile.name));
                     amsg2ExpiredIds = taskContext.expiredIds;
                     amsg2Notices = taskContext.notices;
                 } catch (e) {
                     replyRun.check();
-                    // 挂掉的只是作废回执这半边（它要读历史消息和台账）。进行中清单在内存里，
+                    // 挂掉的只是回执这半边（它要读台账）。进行中清单在内存里，
                     // 照常渲染——角色至少知道自己名下有哪些任务，不至于一问三不知再排一条。
-                    console.warn('[amsg2] 作废回执检出失败，本轮只带进行中清单', e);
+                    console.warn('[amsg2] 回执读取失败，本轮只带进行中清单', e);
                 }
             }
 
@@ -1191,6 +1280,7 @@ export const useChatAI = ({
                     limits: resolveAmsgLimits(liveConfig),
                     committedSends: pending.filter((t) => t.source === 'character').length,
                     activeTasks: pending.length,
+                    context: 'chat',
                 });
                 const text = buildAmsg2TaskContextText(
                     pending,
@@ -1210,6 +1300,15 @@ export const useChatAI = ({
                 // 工具循环的 loopMessages 是 baseReqBody.messages 追加尾巴，前缀没动，下标照用。
                 return insertAmsg2TaskContextBlock(messages, block, payload.volatileTailIndex);
             };
+            // 带工具时说清「这次回复」从哪条消息算起，同样插在易变尾段之前。
+            // 即时对话上云用的是 fullMessages，worker 那边自己加，这里不会重复。
+            if (baseReqBody.tools?.length || mcpToolResolve) {
+                baseReqBody.messages = insertAmsg2TaskContextBlock(
+                    baseReqBody.messages,
+                    { role: 'system', content: buildReplyScopeRule('user') },
+                    payload.volatileTailIndex,
+                );
+            }
 
             // ─── 即时对话（主动消息 2.0 云端生成）分支 ───
             // 这一轮的上下文 + 任务一个 POST 上云，云端跑完走推送回来（收件箱同一条管线入库），
@@ -1226,9 +1325,9 @@ export const useChatAI = ({
             // 一台 enabled 的 MCP 服务器，即时对话就永远静默走回本地——设置页亮着
             // 「已开启」、界面毫无异样，用户查无可查。
             if (instantChatRoute) {
-                // 作废回执跟着 chat 段上云：检出（collectAmsg2TaskContext，带落台账的副作用）
-                // 在上面已经跑过了，本地路径靠 withAmsg2TaskContext 注入的排程清单和能力
-                // 简介到点由 worker 的 instant timely block 现算现渲，唯独回执云端没有——
+                // 回执跟着 chat 段上云：台账（collectAmsg2TaskContext）在上面已经读过了。
+                // 本地路径靠 withAmsg2TaskContext 注入的排程清单和能力简介，
+                // worker 的 instant timely block 现算清单、复用 buildAmsg2ChatScheduleBrief；唯独回执云端没有——
                 // 只把这一样单独成块贴上，不带清单不带简介，别和到点渲染的那份撞车。
                 const amsg2NoticesBlock = amsg2ToolsInjected && amsg2Notices.length
                     ? buildAmsg2NoticesText(amsg2Notices, resolveCharTimeZone(char), userProfile.name)
@@ -1240,13 +1339,17 @@ export const useChatAI = ({
                     historyMsgs: contextMsgs,
                     reroll: skipEmotionInjection,
                 });
+                sendProgress.sending();
                 const instantChatResult = await replyStep(async () => sendInstantChatTurn({
                     signal: replyRun.signal,
                     char,
                     // 云端要发给模型的就是本地这一份，一个字不改（见 fire_pack 的 chat 段）。
+                    // 回执块和 worker 时效块都插在易变尾段之前，与本地 withAmsg2TaskContext 同位：
+                    // 「回到你自己」钢印留在模型开口前的最后一眼。
                     chatMessages: (amsg2NoticesBlock
-                        ? [...fullMessages, { role: 'system', content: amsg2NoticesBlock }]
+                        ? insertAmsg2TaskContextBlock(fullMessages, { role: 'system', content: amsg2NoticesBlock }, payload.volatileTailIndex)
                         : fullMessages) as Array<{ role: string; content: unknown }>,
+                    timelyInsertAt: payload.volatileTailIndex,
                     // 凭据用本地这一轮的那份：换成别的等于同一句话由不同模型来答，而用户看不出来。
                     // model / temperature 取 baseReqBody 的终值而不是 effectiveApi 的原始值：
                     // 上面那段已经按本地规则把 thinking 后缀（claude 系 -thinking）拼好、
@@ -1269,6 +1372,8 @@ export const useChatAI = ({
                         }
                         : {}),
                     userProfile, groups, realtimeConfig,
+                    // 随行的云端快照复用这一轮刚算好的召回，发送前不再多等一轮向量检索。
+                    ...(payload.palaceRecall ? { palaceRecall: payload.palaceRecall } : {}),
                     // 情绪评估也交给云端：worker 到点和主回复并行跑，结果随最后一条推送回来
                     // （见 worker/amsg/src/emotionEval.ts）。放在这里而不是本地 fire 一枪，
                     // 是因为用户发完就能关页面——留在本地的话，页面一关情绪底色就停更了。
@@ -1279,6 +1384,8 @@ export const useChatAI = ({
                     ...(amsgSarSnapshot ? { sarModule: amsgSarSnapshot } : {}),
                 }));
                 if (instantChatResult.ok) {
+                    // sendInstantChatTurn only succeeds after a valid 202 + task UUID.
+                    sendProgress.accepted();
                     // 这次 POST 已经把权威的那份 fire_pack 传上去了，收尾不必再打脏重传一遍。
                     instantChatAccepted = true;
                     // 202 只说明云端收下了，不说明角色真的读到过这些回执：那一轮可能空输出被
@@ -1290,7 +1397,9 @@ export const useChatAI = ({
                     if (amsg2ExpiredIds.length && instantChatResult.uuid) {
                         stageInstantChatExpiredNotices(char.id, instantChatResult.uuid, amsg2ExpiredIds);
                     }
+                    if(friendFeedMainTask && instantChatResult.uuid)await stageFriendFeedCloudTask(char.id,friendFeedMainTask.id,instantChatResult.uuid).catch(()=>{});
                 } else {
+                    sendProgress.failed();
                     // 没发出去就是没发出去：明确落一条系统消息 + 弹错，用户可以直接重发。
                     // **绝不静默退回本地生成** —— 静默分流那种查无可查的坑踩过一次就够了。
                     const reason = instantChatResult.error || '未知错误';
@@ -1363,7 +1472,7 @@ export const useChatAI = ({
             // 别在用户正聊时又弹主动消息。即时对话路径在上方已 return，天然不重复开 lease。
             // 只对已排程 AI 任务的角色开租约：其余角色没有 worker 消费，开了纯浪费还刷 warn。
             const amsg2Cfg = char.activeMsg2Config;
-            if (amsg2Cfg?.enabled && hasActiveAiTask(amsg2Cfg)) {
+            if (amsg2ToolsInjected && amsg2Cfg?.enabled && hasActiveAiTask(amsg2Cfg)) {
                 startAmsgChatPresence(char.id, getLastRealUserMessageAt(contextMsgs));
             }
 
@@ -1464,9 +1573,10 @@ export const useChatAI = ({
                     if (!toolCalls || !toolCalls.length) break;
                     loopMessages.push({
                         role: 'assistant',
-                        // 空 content + tool_calls 在 Gemini 兼容层会被判 INVALID_ARGUMENT, 给个占位
-                        content: data.choices[0].message.content || '(调用工具中)',
+                        // 空 content + tool_calls 在 Gemini 兼容层会被判 INVALID_ARGUMENT；剥除内联思考后无对白就给占位
+                        content: formatToolRoundHistoryContent(data.choices[0].message.content),
                         tool_calls: toolCalls,
+                        ...toolTurnContinuation(data.choices[0].message),
                     } as any);
                     for (const tc of toolCalls) {
                         const fname: string = tc.function?.name || '';
@@ -1552,15 +1662,20 @@ export const useChatAI = ({
                             } as any);
                         }
                     }
+                    const mcdLeadIn = extractToolRoundLeadIn(data.choices?.[0]?.message?.content);
+                    if (mcdLeadIn) {
+                        amsg2LeadIns.push(mcdLeadIn);
+                        lastSpokenData = data;
+                    }
                     // 让 char 继续生成文字补充 (不再带 tools, 避免无限调)
-                    const followBody = { ...baseReqBody, messages: loopMessages };
+                    const followBody = { ...baseReqBody, messages: withAmsg2TaskContext(loopMessages) };
                     delete followBody.tools;
                     delete followBody.tool_choice;
                     data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '麦当劳点餐回复' }));
                     updateTokenUsage(data, historyMsgCount, `mcd-propose-${it + 1}`);
                     // 第二轮跳过 (我们已经禁用了 tools)
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
@@ -1576,9 +1691,10 @@ export const useChatAI = ({
                     if (!toolCalls || !toolCalls.length) break;
                     loopMessages.push({
                         role: 'assistant',
-                        // 空 content + tool_calls 在 Gemini 兼容层会被判 INVALID_ARGUMENT, 给个占位
-                        content: data.choices[0].message.content || '(调用工具中)',
+                        // 空 content + tool_calls 在 Gemini 兼容层会被判 INVALID_ARGUMENT；剥除内联思考后无对白就给占位
+                        content: formatToolRoundHistoryContent(data.choices[0].message.content),
                         tool_calls: toolCalls,
+                        ...toolTurnContinuation(data.choices[0].message),
                     } as any);
                     for (const tc of toolCalls) {
                         const fname: string = tc.function?.name || '';
@@ -1658,14 +1774,19 @@ export const useChatAI = ({
                             } as any);
                         }
                     }
-                    const followBody = { ...baseReqBody, messages: loopMessages };
+                    const luckinMiniLeadIn = extractToolRoundLeadIn(data.choices?.[0]?.message?.content);
+                    if (luckinMiniLeadIn) {
+                        amsg2LeadIns.push(luckinMiniLeadIn);
+                        lastSpokenData = data;
+                    }
+                    const followBody = { ...baseReqBody, messages: withAmsg2TaskContext(loopMessages) };
                     delete followBody.tools;
                     delete followBody.tool_choice;
                     data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '瑞幸点单回复' }));
                     updateTokenUsage(data, historyMsgCount, `luckin-propose-${it + 1}`);
                     if (!data.choices?.[0]?.message?.tool_calls?.length) break;
                 }
@@ -1688,6 +1809,7 @@ export const useChatAI = ({
                 let lastMcpCallSignature: string | null = null;
                 const amsg2Stall = createAmsg2StallTracker();
                 let amsg2ToolRounds = 0;
+                let nonAmsg2ToolCalls = 0;
                 let wrapUpKind: 'none' | 'hard-limit' | 'stalled' | 'amsg2-stalled' = 'none';
                 for (let it = 0; it < MAX_LOOPS; it++) {
                     const toolCalls = normalizeToolCallsForCompat(
@@ -1700,9 +1822,10 @@ export const useChatAI = ({
                     }
                     loopMessages.push({
                         role: 'assistant',
-                        // 空 content + tool_calls 在 Gemini 兼容层会被判 INVALID_ARGUMENT, 给个占位
-                        content: data.choices[0].message.content || '(调用工具中)',
+                        // 空 content + tool_calls 在 Gemini 兼容层会被判 INVALID_ARGUMENT；剥除内联思考后无对白就给占位
+                        content: formatToolRoundHistoryContent(data.choices[0].message.content),
                         tool_calls: toolCalls,
+                        ...toolTurnContinuation(data.choices[0].message),
                     } as any);
                     let mcpCallsThisRound = 0;
                     let mcpProgressThisRound = false;
@@ -1720,6 +1843,7 @@ export const useChatAI = ({
                         const mcpHit = mcpToolResolve?.get(fname);
                         if (mcpHit) {
                             mcpCallsThisRound += 1;
+                            nonAmsg2ToolCalls += 1;
                             const callSignature = toolCallFingerprint(fname, args);
                             // 连续同名同参通常是模型卡住。先拦再执行，避免发帖 / 下单之类的
                             // 副作用真的重复发生；中间做过其他动作后同参查状态仍会正常放行。
@@ -1755,6 +1879,7 @@ export const useChatAI = ({
                             amsg2Outcomes.push(await replyStep(async () => runAmsg2ToolCall(tc, fname, args, loopMessages, it)));
                             continue;
                         }
+                        nonAmsg2ToolCalls += 1;
                         // 只开了 MCP 没开瑞幸时, 幻觉出的未知工具名直接回错误让模型自我纠正
                         if (!payload.flags.luckinChatActive) {
                             loopMessages.push(buildToolResultMessage(tc, `未知工具 ${fname}, 只能使用系统提供的工具。`) as any);
@@ -1812,7 +1937,10 @@ export const useChatAI = ({
                         // 这一轮写下的回话留着（MCP 轮的开场白已经由 persistMcpLeadIn 单独落库了）。
                         if (mcpCallsThisRound === 0) {
                             const leadIn = extractToolRoundLeadIn(data.choices?.[0]?.message?.content);
-                            if (leadIn) amsg2LeadIns.push(leadIn);
+                            if (leadIn) {
+                                amsg2LeadIns.push(leadIn);
+                                lastSpokenData = data;
+                            }
                         }
                     }
                     const amsg2Stalled = amsg2Stall.record(amsg2Outcomes);
@@ -1830,14 +1958,16 @@ export const useChatAI = ({
                     // 看到的是自己名下真实的排程，不会对着排程前的空清单再排一条。
                     const followMessages = withAmsg2TaskContext(loopMessages);
                     if (forceWrapUp) {
+                        const isAmsg2OnlyWrapUp = nonAmsg2ToolCalls === 0
+                            && (wrapUpKind === 'amsg2-stalled' || (wrapUpKind === 'hard-limit' && amsg2ToolRounds > 0));
                         followMessages.push({
                             role: 'user',
                             // 收尾的原因是主动消息工具时换一句话：排程这件事用户看不见，照 MCP 那句
-                            // 「如实说明卡在哪一步」写的话，角色会跟用户交代「我的提醒排不上」。
-                            content: wrapUpKind === 'amsg2-stalled'
-                                || (wrapUpKind === 'hard-limit' && !mcpToolResolve && !payload.flags.luckinChatActive)
-                                ? AMSG2_WRAP_UP_PROMPT
-                                : `[系统消息：工具阶段${stalled ? '连续两轮没有产生新结果' : '已到本轮安全上限'}。请停止调用工具，基于已经拿到的结果直接用角色语气回复；如目标仍未完成，请如实说明卡在哪一步。不要输出工具名、参数或这条系统消息。]`,
+                            // 「如实说明卡在哪一步」写的话，角色会跟用户交代「我的提醒排不上」；
+                            // 同时区分前面步骤里是否已经写过对白，避免让模型把说过的话重写一遍。
+                            content: isAmsg2OnlyWrapUp
+                                ? buildAmsg2WrapUpPrompt(amsg2LeadIns.length > 0 || displayedMcpLeadIns.size > 0)
+                                : `[系统消息：工具阶段${stalled ? '连续两轮没有产生新结果' : '已到这次回复的安全上限'}。请停止调用工具，基于已经拿到的结果直接用角色语气回复；如目标仍未完成，请如实说明卡在哪一步。不要输出工具名、参数或这条系统消息。]`,
                         });
                     }
                     const followBody = { ...baseReqBody, messages: followMessages };
@@ -1845,22 +1975,28 @@ export const useChatAI = ({
                         delete followBody.tools;
                         delete followBody.tool_choice;
                     }
+                    const loopPurpose = payload.flags.luckinChatActive
+                        ? '瑞幸点单续写'
+                        : mcpCallsThisRound > 0
+                            ? 'MCP 工具续写'
+                            : '排程工具续写';
                     data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: loopPurpose }));
                     updateTokenUsage(data, historyMsgCount, `${payload.flags.luckinChatActive ? 'luckin-chat' : 'mcp-chat'}-${it + 1}`);
                     if (forceWrapUp) break;
                 }
                 // 主动消息工具跑过、模型最后却一个字没说（常见于排成功之后：它觉得话在工具轮
                 // 已经说完了），而工具轮里也没留下话——补一轮不带 tools 的请求让它开口。
-                // 已经逼过一次收尾的不再补，免得一轮聊天无止境地加请求。
+                // 已经逼过一次收尾或 MCP 已落过开场白的不再补，免得一轮聊天重复发请求。
                 let emptyRescued = false;
                 if (
                     amsg2ToolRounds > 0
                     && wrapUpKind === 'none'
                     && amsg2LeadIns.length === 0
+                    && displayedMcpLeadIns.size === 0
                     && !extractToolRoundLeadIn(data.choices?.[0]?.message?.content)
                     && !data.choices?.[0]?.message?.tool_calls?.length
                 ) {
@@ -1875,7 +2011,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(rescueBody),
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: '排程后补充回复' }));
                     updateTokenUsage(data, historyMsgCount, 'amsg2-empty-rescue');
                 }
                 if (amsg2ToolRounds > 0) {
@@ -1926,7 +2062,7 @@ export const useChatAI = ({
                             signal: replyRun.signal,
                             method: 'POST', headers,
                             body: JSON.stringify(wrapBody)
-                        }));
+                        }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP 工具收尾回复' }));
                         updateTokenUsage(data, historyMsgCount, `mcp-text-wrap-${it + 1}`);
                         break;
                     }
@@ -1955,7 +2091,7 @@ export const useChatAI = ({
                     if (reachedHardLimit) {
                         textLoopMessages.push({
                             role: 'user',
-                            content: '[系统消息：工具阶段已到本轮安全上限。停止调用工具，基于已有结果直接回复；如目标未完成就如实说明。不要输出工具调用格式或提及本消息。]',
+                            content: '[系统消息：工具阶段已到这次回复的安全上限。停止调用工具，基于已有结果直接回复；如目标未完成就如实说明。不要输出工具调用格式或提及本消息。]',
                         });
                     }
                     setSearchStatus('正在整理 MCP 工具结果...');
@@ -1964,7 +2100,7 @@ export const useChatAI = ({
                         signal: replyRun.signal,
                         method: 'POST', headers,
                         body: JSON.stringify(followBody)
-                    }));
+                    }, 2, 0, { appId: 'chat', appName: '消息', charId: char.id, charName: char.name, purpose: 'MCP 工具续写' }));
                     updateTokenUsage(data, historyMsgCount, `mcp-text-${it + 1}`);
                     if (reachedHardLimit) break;
                 }
@@ -2016,11 +2152,18 @@ export const useChatAI = ({
                 }
                 setMessages(msgs);
             };
-            // 工具轮里说过的话拼在最前面（没有工具轮时 amsg2LeadIns 是空的，原样取最后一轮）。
-            const rawAiContent = amsg2LeadIns.length
-                ? mergeToolRoundLeadIns(amsg2LeadIns, data.choices?.[0]?.message?.content || '')
-                : data.choices?.[0]?.message?.content || '';
-            const sarReply = parseSARModuleReply(rawAiContent, sarModulePlan);
+            // 工具轮里说过的话拼在最前面（没有工具轮时 amsg2LeadIns 是空的，原样取最后一轮）；
+            // SAR 信封生效期若跨多轮输出了信封，逐轮拆解后再合并去重真意与外显。
+            const finalRoundContent = data.choices?.[0]?.message?.content || '';
+            const sarReply = amsg2LeadIns.length && sarModulePlan.requiresEnvelope
+                ? parseSARModuleReplyRounds([...amsg2LeadIns, extractToolRoundLeadIn(finalRoundContent)], sarModulePlan)
+                : parseSARModuleReply(
+                    amsg2LeadIns.length ? mergeToolRoundLeadIns(amsg2LeadIns, finalRoundContent) : finalRoundContent,
+                    sarModulePlan,
+                );
+            const effectivePostProcessData = extractToolRoundLeadIn(finalRoundContent)
+                ? data
+                : (lastSpokenData ?? data);
             const latestUserMessage = findSARTurnUserMessage(currentMsgs);
             const sarModuleEvents = createSARModuleEventMeta(sarModulePlan);
             const userSurfaces = parseSARUserSurfaces(sarReply.userSurface,
@@ -2057,7 +2200,7 @@ export const useChatAI = ({
                 groups,
                 contextMsgs,
                 fullMessages,
-                initialData: data,
+                initialData: effectivePostProcessData,
                 historyMsgCount,
                 mcdInheritMeta,
                 xhsCaches,
@@ -2085,6 +2228,7 @@ export const useChatAI = ({
                 directives: [],
                 sarModuleSurface: assistantSurfaceMeta,
             }));
+            replyRun.markCompleted();
             // 最后一批正式消息已交给 setMessages；同一轮更新撤掉预览，不再逐条补弹。
             setStreamingBubbles([]);
             setStreamingThinking('');
@@ -2116,12 +2260,17 @@ export const useChatAI = ({
             if (amsg2ExpiredIds.length) {
                 void ActiveMsgStore.markExpiredNoticesNotified(char.id, amsg2ExpiredIds);
             }
+            if(friendFeedMainTask)await acknowledgeFriendFeedNotices(char.id,friendFeedMainTask.id).catch(()=>{});
 
         } catch (e: any) {
+            if (!replyRun.signal.aborted) sendProgress.failed();
             if (replyRun.signal.aborted) return;
             // 注意: 这个 catch 兜的是「拿到 API 响应之后」的整条后处理管线 (applyAssistantPostProcessing,
             // 13 步)。这里抛错多半不是网络问题, 而是解析/正则/落库异常。别再叫"连接中断"误导排查。
             const errMsg = e?.message || String(e);
+            if (showError && /API Error \d{3}|Failed to fetch|API返回了|输出被截断|模型.*格式不正确/i.test(errMsg)) {
+                showError('聊天回复失败', errMsg, effectiveApi);
+            }
             // 瑞一杯模式下报错: 大概率是聊天模型/中转不支持 function calling(tools) → 带 tools 一发就 400。
             // 在 APK 里看不到控制台, 这里把完整原因 + 解法存成可读消息, 方便排查。
             if (luckinChatRef?.current?.active && /\b400\b|tool|function[_\s-]?call/i.test(errMsg)) {
@@ -2134,6 +2283,8 @@ export const useChatAI = ({
             }
             setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
         } finally {
+            replyRun.signal.removeEventListener('abort', cancelSendProgress);
+            sendProgress.finish(replyRun.signal.aborted);
             try {
                 await replyRun.settle();
                 if (replyRun.signal.aborted) setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
@@ -2163,6 +2314,10 @@ export const useChatAI = ({
             // fire_pack 会停在排程那一刻、少掉角色排完之后说的这段。
             // 即时对话受理成功那一轮跳过：那次 POST 已经把这一轮的 fire_pack（还多带了
             // chat 段）传上去了，这里再打脏就是同样的内容再走一趟网络。
+            if (friendFeedMainTask && !instantChatAccepted) {
+                await releaseFriendFeedEmotionTask(char.id, friendFeedMainTask.id)
+                    .catch(error => console.warn('[Friend feed] Main task release failed', error));
+            }
             if (!instantChatAccepted) {
                 markAmsgStateDirty({
                     char: { ...char, activeMsg2Config: amsg2Session.getConfig() },
@@ -2247,27 +2402,12 @@ export const useChatAI = ({
 
 
 
-    // ─── Proactive Messaging Controls ───
-    // NOTE: The actual proactive trigger handler is registered globally in OSContext
-    // so it works even when Chat is not open. These are just start/stop helpers.
-
-    const startProactiveChat = (intervalMinutes: number) => {
-        if (!char) return;
-        ProactiveChat.start(char.id, intervalMinutes);
-    };
-
-    const stopProactiveChat = () => {
-        if (!char) return;
-        ProactiveChat.stop(char.id);
-    };
-
-    const isProactiveActive = char ? ProactiveChat.isActiveFor(char.id) : false;
-
     return {
         isTyping,
         streamingBubbles,
         streamingThinking,
         streamingHandoverIds,
+        inboxStatus,
         recallStatus,
         searchStatus,
         diaryStatus,
@@ -2282,9 +2422,6 @@ export const useChatAI = ({
         tokenBreakdown,
         setLastTokenUsage, // Allow manual reset if needed
         triggerAI,
-        startProactiveChat,
-        stopProactiveChat,
-        isProactiveActive,
         lastSystemPrompt,
         evolvedNarrative,
     };

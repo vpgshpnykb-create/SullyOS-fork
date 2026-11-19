@@ -17,6 +17,8 @@
 import { CharacterProfile } from '../types';
 import { ActiveMsgClient } from './activeMsgClient';
 import { ActiveMsgStore } from './activeMsgStore';
+import { isAmsg2WorkerActive } from './amsgGlobalGate';
+import { clearStoppedReplyReceipts } from './amsgStoppedReplyClient';
 import {
   ALL_CREDENTIAL_PURPOSES,
   charCredId,
@@ -122,9 +124,27 @@ export const purgeCloudCharById = async (
 ): Promise<CharCloudStateCleanup> => {
   if (!charId) return { status: 'skipped' };
 
+  if (plan.clientState) {
+    clearStoppedReplyReceipts(charId);
+    if (typeof ActiveMsgStore.clearCharActionResults === 'function') {
+      await ActiveMsgStore.clearCharActionResults(charId).catch(() => {});
+    }
+  }
+
+  let globalConfig: Awaited<ReturnType<typeof ActiveMsgStore.getGlobalConfig>>;
   try {
-    const globalConfig = await ActiveMsgStore.getGlobalConfig();
-    if (!globalConfig.workerUrl?.trim()) return { status: 'skipped' };
+    globalConfig = await ActiveMsgStore.getGlobalConfig();
+    if (plan.clientState && Array.isArray(globalConfig.sidechannelShellsSweptCharIds) && globalConfig.sidechannelShellsSweptCharIds.includes(charId)) {
+      await ActiveMsgStore.saveGlobalConfig({
+        sidechannelShellsSweptCharIds: globalConfig.sidechannelShellsSweptCharIds.filter((id) => id !== charId),
+      }).catch(() => {});
+    }
+    if (!isAmsg2WorkerActive(globalConfig)) {
+      if (plan.credPurposes.length > 0) {
+        forgetCredIds(plan.credPurposes.map((purpose) => charCredId(charId, purpose)));
+      }
+      return { status: 'skipped' };
+    }
   } catch {
     // 连本地配置都读不到，等于无从判断有没有云端；按没有处理，别为它弹错误。
     return { status: 'skipped' };

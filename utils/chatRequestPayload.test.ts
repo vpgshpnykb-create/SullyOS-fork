@@ -37,6 +37,38 @@ const baseInput = (): BuildChatPayloadInput => ({
 const joinMessages = (messages: Array<{ content: any }>): string =>
     messages.map(m => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n');
 
+it.each([false, true])('excludes original thinking, its translation and bilingual pairs from actual chat context (worker=%s)', async timelyByWorker => {
+    const input = baseInput();
+    input.historyMsgs.unshift({ id: 0, charId: input.char.id, role: 'assistant', type: 'text', content: '这是角色说出口的正文。', timestamp: input.historyMsgs[0].timestamp - 1 });
+    const baseline = await buildChatRequestPayload({ ...input, timelyByWorker });
+    const thinkingChain = 'PRIVATE_THINKING_SOURCE_7f2b';
+    const text = '仅供界面展示的中文译文_9a81';
+    const decorated = { ...input, timelyByWorker, historyMsgs: input.historyMsgs.map(message => message.role === 'assistant' ? {
+        ...message, metadata: { thinkingChain, thinkingChainTranslation: { source: thinkingChain, text, segments: [{ source: thinkingChain, text }] } },
+    } : message) };
+    const payload = await buildChatRequestPayload(decorated);
+    expect(payload.cleanedApiMessages).toEqual(baseline.cleanedApiMessages);
+    expect(joinMessages(payload.fullMessages)).toContain('这是角色说出口的正文。');
+    expect(JSON.stringify(payload.fullMessages)).not.toContain(thinkingChain);
+    expect(JSON.stringify(payload.fullMessages)).not.toContain(text);
+    expect(JSON.stringify(payload.fullMessages)).not.toContain('thinkingChainTranslation');
+    // Proactive message transcripts use this same history formatter.
+    expect(ChatPrompts.buildMessageHistory(decorated.historyMsgs, 20, input.char, input.userProfile, []).apiMessages)
+        .toEqual(ChatPrompts.buildMessageHistory(input.historyMsgs, 20, input.char, input.userProfile, []).apiMessages);
+});
+
+it.each([false,true])('adds home phone background only to this request (worker=%s) and retains normal chat history', async timelyByWorker => {
+    const input={...baseInput(),timelyByWorker};
+    const background='【家园手机聊天】你们在客厅里用手机聊天。';
+    const phone=await buildChatRequestPayload({...input,homePhoneContext:background});
+    expect(joinMessages(phone.fullMessages)).toContain(background);
+    expect(phone.systemPrompt).toContain(background);
+    expect(phone.cleanedApiMessages.some(m=>m.role==='user'&&String(m.content).includes('在吗'))).toBe(true);
+    const normal=await buildChatRequestPayload(input);
+    expect(joinMessages(normal.fullMessages)).not.toContain(background);
+    expect(input.char).not.toHaveProperty('homePhoneContext');
+});
+
 it('本地仅节假日感知可独立注入一句，云端生成不烤进本地提醒', async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date(2026, 8, 27, 12));
     const input = baseInput();
@@ -376,4 +408,55 @@ it('文本入口误传 history 时仍保留深度世界书，不丢弃移交后�
         undefined, undefined, undefined, undefined, undefined, { history: [] },
     );
     expect(result.split('TEXT_ONLY_DEPTH_BOOK')).toHaveLength(2);
+});
+
+
+describe('ChatApp 按月 RECALL 提示偏好', () => {
+    it.each([false, true])('禁用自主月度查阅时，聊天和后台模板均不教 RECALL（worker=%s），保留月度总结与小眼睛记忆', async timelyByWorker => {
+        const input = baseInput();
+        const char = { ...input.char, monthlyRecallEnabled: false, hideMonthlyRecallPrompt: false,
+            activeMemoryMonths: ['2026-09'], refinedMemories: { '2026-09': '仍然可见的月度总结' },
+            memories: [{ id: 'month-recall-off', date: '2026-09-01', summary: '小眼睛选中的详细记忆' }],
+        } as any;
+        const payload = await buildChatRequestPayload({ ...input, timelyByWorker, char });
+        expect(payload.systemPrompt).not.toContain('[[RECALL');
+        expect(payload.systemPrompt).toContain('仍然可见的月度总结');
+        expect(payload.systemPrompt).toContain('小眼睛选中的详细记忆');
+        const fire = await ChatPrompts.buildSystemPromptParts(char, input.userProfile, [], [], [], [],
+            undefined, undefined, undefined, undefined, undefined, undefined, { forFirePack: true });
+        expect(fire.stable).not.toContain('[[RECALL');
+    });
+    const recallRule = "- 调取记忆: `[[RECALL: YYYY-MM]]`，请注意，当用户提及具体某个月份时，或者当你想仔细想某个月份的事情时，欢迎你随时使该动作";
+    for (const timelyByWorker of [false, true]) {
+        it.each([undefined, true])('本地/云端模式 '+timelyByWorker+'：缺省或开启 %s 时隐藏指令教学', async hideMonthlyRecallPrompt => {
+            const input = baseInput();
+            const payload = await buildChatRequestPayload({ ...input, timelyByWorker,
+                char: { ...input.char, hideMonthlyRecallPrompt },
+            });
+            expect(payload.systemPrompt).not.toContain(recallRule);
+        });
+        it('本地/云端模式 '+timelyByWorker+'：关闭时仅恢复原来的那一行', async () => {
+            const input = baseInput();
+            const hidden = await buildChatRequestPayload({ ...input, timelyByWorker,
+                char: { ...input.char, hideMonthlyRecallPrompt: true },
+            });
+            const visible = await buildChatRequestPayload({ ...input, timelyByWorker,
+                char: { ...input.char, hideMonthlyRecallPrompt: false },
+            });
+            expect(visible.systemPrompt).toContain(recallRule);
+            expect(visible.systemPrompt.replace('   '+recallRule+'\n', '')).toBe(hidden.systemPrompt);
+        });
+    }
+    it('后台主动消息打包保留原教学，且不修改记忆或激活月份', async () => {
+        const input = baseInput();
+        const char = { ...input.char, hideMonthlyRecallPrompt: true,
+            activeMemoryMonths: ['2026-09'],
+            memories: [{ id: 'recall-pref-m1', date: '2026-09-01', mood: 'happy', summary: '已保存的经历' }],
+        } as any;
+        const before = JSON.stringify(char);
+        const result = await ChatPrompts.buildSystemPromptParts(char, input.userProfile, [], [], [], [],
+            undefined, undefined, undefined, undefined, undefined, undefined, { forFirePack: true });
+        expect(result.stable).toContain(recallRule);
+        expect(JSON.stringify(char)).toBe(before);
+    });
 });

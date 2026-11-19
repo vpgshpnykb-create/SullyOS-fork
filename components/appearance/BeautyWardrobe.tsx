@@ -1,18 +1,22 @@
+import type {WardrobeUsage, WardrobeUsageReader} from '../../utils/wardrobeUsage';
 import React, { useEffect, useRef, useState } from 'react';
+import { useLocalBackHandler } from '../../hooks/useLocalBackHandler';
 import { createPortal } from 'react-dom';
 import { DB } from '../../utils/db';
 import type { BeautyShare } from '../../utils/beautyShareContract';
+import {useWardrobeDetailDialog} from '../chat/ChatDecorationTrial';
+import {validateDecoration} from '../../utils/chatDecoration';
 import BeautyPresetPreview from '../share/BeautyPresetPreview';
 import type { BeautySource } from '../share/BeautySharePanel';
 import './BeautyWardrobe.css';
 import { BeautyRepoBadge } from '../share/BeautyRepoInvitation';
 import {readDecorationOrigin,originLabel,canEditDecoration,type DecorationOrigin} from '../../utils/decorationLibrary';
 
-export interface WardrobeEntry extends BeautySource { attributionKey: () => Promise<string>; contents?: string }
-interface WardrobeActions {onEdit?:(entry:WardrobeEntry)=>void;onExport?:(entry:WardrobeEntry)=>void;onShare?:(entry:WardrobeEntry)=>void;onDelete?:(entry:WardrobeEntry)=>void;onUpdate?:(entry:WardrobeEntry)=>void|Promise<void>}
+export interface WardrobeEntry extends BeautySource { attributionKey: () => Promise<string>; contents?: string; readLocal?: () => Promise<unknown> }
+interface WardrobeActions {getUsage?:WardrobeUsageReader;onEdit?:(entry:WardrobeEntry)=>void;onExport?:(entry:WardrobeEntry)=>void;onShare?:(entry:WardrobeEntry)=>void;onDelete?:(entry:WardrobeEntry)=>void;onUpdate?:(entry:WardrobeEntry)=>void|Promise<void>}
 interface Loaded { pack: unknown; share: BeautyShare | null; origin:DecorationOrigin }
 
-function WardrobeTile({ entry, onOpen, ...actions }: WardrobeActions & { entry: WardrobeEntry; onOpen: (entry: WardrobeEntry, loaded?: Loaded) => void }) {
+function WardrobeTile({ entry, onOpen, getUsage, ...actions }: WardrobeActions & { entry: WardrobeEntry; onOpen: (entry: WardrobeEntry, loaded?: Loaded) => void }) {
   const tile = useRef<HTMLButtonElement>(null);
   const latest = useRef(entry); latest.current = entry;
   const [visible, setVisible] = useState(false);
@@ -31,11 +35,13 @@ function WardrobeTile({ entry, onOpen, ...actions }: WardrobeActions & { entry: 
     loadEntry(latest.current).then(value => { if (alive) setLoaded(value); }).catch(e => { if (alive) setError(e instanceof Error ? e.message : '装扮读取失败'); });
     return () => { alive = false; };
   }, [visible, entry.id, entry.revision]);
+  const [usage,setUsage]=useState<WardrobeUsage>('');
+  useEffect(()=>{let alive=true;setUsage('');if(loaded&&getUsage)void getUsage(loaded.pack).then(value=>{if(alive)setUsage(value);});return()=>{alive=false;};},[loaded,getUsage]);
   return <article className="wardrobe-item"><button ref={tile} type="button" className="wardrobe-tile" onClick={() => onOpen(entry, loaded)} aria-label={`预览 ${entry.name}`}>
     <div className="wardrobe-cover" aria-hidden="true">
       {loaded ? <BeautyPresetPreview data={loaded.pack} compact/> : <span className="wardrobe-placeholder">{error ? '点按重试预览' : '预览载入中'}</span>}
     </div>
-    <strong>{entry.name}</strong><span className="wardrobe-credit">{loaded ? `${originLabel(loaded.origin)}${loaded.origin.credit?' · '+loaded.origin.credit:''}${!canEditDecoration(loaded.origin)?' · 禁止二改':''}` : error ? '读取失败 · 可重试或删除' : '正在读取来源'}</span>
+    <strong>{entry.name}</strong>{usage&&<span className="wardrobe-usage">{usage}</span>}<span className="wardrobe-credit">{loaded ? `${originLabel(loaded.origin)}${loaded.origin.credit?' · '+loaded.origin.credit:''}${!canEditDecoration(loaded.origin)?' · 禁止二改':''}` : error ? '读取失败 · 可重试或删除' : '正在读取来源'}</span>
   </button>{error&&<p className="wardrobe-credit" role="alert">{error}</p>}<CardActions entry={entry} origin={loaded?.origin} {...actions}/ >{loaded?.share && <BeautyRepoBadge share={loaded.share}/>}</article>;
 }
 
@@ -54,7 +60,7 @@ function CardActions({entry,origin,onEdit,onShare,onDelete,onUpdate}:WardrobeAct
 }
 
 async function loadEntry(entry: WardrobeEntry): Promise<Loaded> {
-  const pack = await entry.read();
+  const pack = await (entry.readLocal || entry.read)();
   let share: BeautyShare | null = null;
   try {
     const raw = await DB.getAsset('beauty_source_' + await entry.attributionKey());
@@ -65,11 +71,12 @@ async function loadEntry(entry: WardrobeEntry): Promise<Loaded> {
 }
 
 function WardrobeDetail({ entry, initial, onClose, onApply,onEdit,onExport,onShare,onDelete,onUpdate }: WardrobeActions & { entry: WardrobeEntry; initial?: Loaded; onClose: () => void; onApply: (entry: WardrobeEntry) => void;onEdit?:(entry:WardrobeEntry)=>void;onExport?:(entry:WardrobeEntry)=>void }) {
-  const dialog = useRef<HTMLDialogElement>(null);
+  const {dialog,trial} = useWardrobeDetailDialog();
+  const [starting,setStarting] = useState(false);
   const [loaded, setLoaded] = useState(initial);
   const [error, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
-  useEffect(() => { dialog.current?.showModal(); return () => dialog.current?.close(); }, []);
+  useLocalBackHandler(() => { if(!starting)onClose(); return true; }, 40);
   useEffect(() => {
     if (initial) return;
     let alive = true; setError('');
@@ -77,8 +84,8 @@ function WardrobeDetail({ entry, initial, onClose, onApply,onEdit,onExport,onSha
     return () => { alive = false; };
   }, [entry, initial, attempt]);
   const metadata = loaded?.share?.metadata;
-  return createPortal(<dialog ref={dialog} className="wardrobe-detail" aria-labelledby="wardrobe-detail-title" onCancel={onClose}>
-    <header><button type="button" onClick={onClose} aria-label="返回我的装扮">‹</button><span>装扮预览</span>{loaded?.share ? <BeautyRepoBadge share={loaded.share}/> : <span className="wardrobe-detail-label">本机</span>}</header>
+  return createPortal(<dialog ref={dialog} className="wardrobe-detail" aria-labelledby="wardrobe-detail-title" onCancel={e=>{e.preventDefault();if(!starting)onClose();}}>
+    <header><button type="button" disabled={starting} onClick={onClose} aria-label="返回我的装扮">‹</button><span>装扮预览</span>{loaded?.share ? <BeautyRepoBadge share={loaded.share}/> : <span className="wardrobe-detail-label">本机</span>}</header>
     <div className="wardrobe-detail-scroll">
       <div className="wardrobe-detail-stage">{loaded ? <BeautyPresetPreview data={loaded.pack}/> : error ? <div role="alert"><p>{error}</p><button onClick={() => setAttempt(v => v + 1)}>重新载入</button></div> : <p role="status">正在载入预览…</p>}</div>
       <div className="wardrobe-detail-info"><h2 id="wardrobe-detail-title">{entry.name}</h2><p>{metadata ? `作者 · ${metadata.credit}` : '保存在这台设备上的装扮'}</p>
@@ -93,11 +100,19 @@ function WardrobeDetail({ entry, initial, onClose, onApply,onEdit,onExport,onSha
         </details>}
       </div>
     </div>
-    <footer><span>应用后查看实际效果</span><button type="button" disabled={!loaded} onClick={() => { onClose(); onApply(entry); }}>立即应用</button></footer>
+    {loaded&&error&&<p role="alert">{error}</p>}
+    <footer>{trial && entry.kind==='chat-decoration' && !entry.categories?.some(c=>['date','story','collaboration','journal','schedule'].includes(c)) ?
+      <button type="button" disabled={!loaded||starting} onClick={async()=>{
+        if(!loaded)return;
+        setStarting(true);setError('');
+        try{await trial.start(validateDecoration(loaded.pack),loaded.origin);}
+        catch(e){setError(e instanceof Error?e.message:'试用失败');}
+        finally{setStarting(false);}
+      }}>{starting?'准备中…':'试用'}</button>:<span>应用后查看实际效果</span>}<button type="button" disabled={!loaded||starting} onClick={() => { onClose(); onApply(entry); }}>立即应用</button></footer>
   </dialog>, document.body);
 }
 
-export default function BeautyWardrobe({ entries, onApply,onEdit,onExport,onShare,onDelete,onUpdate, searchOpen = false, title = '我的收藏' }: WardrobeActions & { entries: WardrobeEntry[]; onApply: (entry: WardrobeEntry) => void;onEdit?:(entry:WardrobeEntry)=>void;onExport?:(entry:WardrobeEntry)=>void; searchOpen?: boolean; title?: string }) {
+export default function BeautyWardrobe({ entries, getUsage, onApply,onEdit,onExport,onShare,onDelete,onUpdate, searchOpen = false, title = '我的收藏' }: WardrobeActions & { entries: WardrobeEntry[]; onApply: (entry: WardrobeEntry) => void;onEdit?:(entry:WardrobeEntry)=>void;onExport?:(entry:WardrobeEntry)=>void; searchOpen?: boolean; title?: string }) {
   const [query, setQuery] = useState('');
   useEffect(() => { if (!searchOpen) { setQuery(''); setPage(0); } }, [searchOpen]);
   const [page, setPage] = useState(0);
@@ -110,7 +125,7 @@ export default function BeautyWardrobe({ entries, onApply,onEdit,onExport,onShar
   return <div ref={list} className="wardrobe-library">
     {searchOpen && <input autoFocus className="wardrobe-search" aria-label="查找本机装扮" placeholder="搜索已收藏的装扮" value={query} onChange={e => { setQuery(e.target.value); setPage(0); }}/ >}
     <div className="wardrobe-list-caption"><h3>{title}</h3><span>本机 · {filtered.length} 款</span></div>
-    <div className="wardrobe-grid">{filtered.slice(current * 12, current * 12 + 12).map(entry => <WardrobeTile key={entry.id} entry={entry} onEdit={onEdit} onShare={onShare} onDelete={onDelete} onUpdate={onUpdate} onOpen={(item, loaded) => setSelected({ entry: item, loaded })}/>)}</div>
+    <div className="wardrobe-grid">{filtered.slice(current * 12, current * 12 + 12).map(entry => <WardrobeTile getUsage={getUsage} key={entry.id} entry={entry} onEdit={onEdit} onShare={onShare} onDelete={onDelete} onUpdate={onUpdate} onOpen={(item, loaded) => setSelected({ entry: item, loaded })}/>)}</div>
     {!filtered.length && <div className="wardrobe-empty"><span>✧</span><h3>{query ? '没有找到这款装扮' : '把喜欢的装扮留在这里'}</h3><p>{query ? '换个名称试试。' : '保存预设、导入文件或用分享码领取后，就能在这里预览和应用。'}</p></div>}
     {pages > 1 && <nav className="wardrobe-pagination" aria-label="本机装扮分页"><button disabled={current === 0} onClick={() => turnPage(current - 1)}>上一页</button><span>{current + 1} / {pages}</span><button disabled={current + 1 === pages} onClick={() => turnPage(current + 1)}>下一页</button></nav>}
     {selected && <WardrobeDetail entry={selected.entry} initial={selected.loaded} onClose={() => setSelected(undefined)} onApply={onApply} onEdit={onEdit} onExport={onExport} onShare={onShare} onDelete={onDelete} onUpdate={onUpdate}/>}

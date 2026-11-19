@@ -49,6 +49,62 @@ async function fixture(){
   return {db,env,files,pub,api,submit,approve,snapshot,fire,storage};
 }
 describe('公开装扮库：真实 SQL、审批和快照边界',()=>{
+  it.each([false,true])('角色名片按码领取并进入分类，混搭白框 %s',async mixed=>{
+    const f=await fixture();
+    const profile={customCss:'.chat-profile-portrait { border-radius: 50%; }'};
+    const parts={...(mixed ? pack.parts : {}),profile};
+    const submit=await f.api('/submissions','author',{metadata,package:{...pack,parts:{...parts,profile:{...profile,character:'私人资料'}}},catalogCover:cover});
+    expect(submit.status).toBe(201);
+    await f.approve(submit.value.revision);await f.fire();
+    const entry=f.snapshot().entries[0];
+    expect(entry.categories).toEqual(mixed?['chat','whitebox','profile']:['chat','profile']);
+    expect(JSON.parse(f.pub.get(entry.file)!.value as string).parts).toEqual(parts);
+    expect((await f.api('/shares/'+entry.code+'/file?revision='+entry.revision)).value.parts).toEqual(parts);
+    const invalid=await f.api('/submissions','author',{metadata,package:{...pack,parts:{profile:{customCss:'body { color: red }'}}},catalogCover:cover});
+    expect(invalid.status).toBe(400);
+  });
+  it.each(['date','story'])('%s 自定义阅读 CSS 经投稿审核与目录导出完整保留',async part=>{
+    const f=await fixture();
+    const appearance={preset:'night',customCss:'.meeting-reading { --meeting-paper: #112233; }'};
+    const response=await f.api('/submissions','author',{metadata,package:{...pack,parts:{[part]:{...appearance,messages:['PRIVATE']}}},catalogCover:cover});
+    expect(response.status).toBe(201);
+    await f.approve(response.value.revision);await f.fire();
+    const entry=f.snapshot().entries[0];expect(entry.categories).toEqual([part]);
+    expect(JSON.parse(f.pub.get(entry.file)!.value as string).parts).toEqual({[part]:appearance});
+    expect((await f.api('/shares/'+entry.code)).status).toBe(200);
+    const updated={...appearance,preset:'paper',customCss:'.meeting-reading { --meeting-paper: #ffeedd; }'};
+    const next=await f.api('/submissions/'+response.value.id,'author',{metadata,package:{...pack,parts:{[part]:updated}},catalogCover:cover,expectedRevision:response.value.revision});
+    expect(next.status).toBe(201);
+    // Pending updates must not replace the version already available by code.
+    expect((await f.api('/shares/'+entry.code+'/file?revision='+response.value.revision)).value.parts).toEqual({[part]:appearance});
+    await f.approve(next.value.revision);await f.fire();
+    const published=f.snapshot().entries[0];expect(published.code).toBe(entry.code);
+    expect(JSON.parse(f.pub.get(published.file)!.value as string).parts).toEqual({[part]:updated});
+    expect((await f.api('/shares/'+entry.code+'/file?revision='+next.value.revision)).value.parts).toEqual({[part]:updated});
+  });
+  it('协同工作投稿通过审核后进入独立分类，分享码只带外观',async()=>{
+    const f=await fixture();
+    const collaboration={uiTheme:'midnight',customCss:'.collab-ui-root { --collab-accent: pink; }',avatarMode:'both',avatarStyle:'circle'};
+    const response=await f.api('/submissions','author',{metadata,package:{...pack,parts:{collaboration:{...collaboration,immersive:{apiKey:'PRIVATE'},messages:['PRIVATE']}}},catalogCover:cover});
+    expect(response.status).toBe(201);
+    await f.fire();expect(f.snapshot().entries).toHaveLength(0);
+    await f.approve(response.value.revision);await f.fire();
+    const entry=f.snapshot().entries[0];expect(entry.categories).toEqual(['collaboration']);
+    expect(JSON.parse(f.pub.get(entry.file)!.value as string).parts).toEqual({collaboration});
+    expect((await f.api('/shares/'+entry.code)).status).toBe(200);
+  });
+  it('允许第 200 份作品，拒绝第 201 份，删除后释放作者名额',async()=>{
+    const f=await fixture();
+    const first=await f.submit();
+    const author=(f.db.prepare('SELECT author_code FROM submissions WHERE id=?').get(first.id) as any).author_code;
+    const insert=f.db.prepare("INSERT INTO submissions(id,author_code,kind,created_at,updated_at) VALUES(?,?,'chat-decoration',0,0)");
+    for(let i=1;i<199;i++)insert.run('quota-'+i,author);
+    await f.submit();
+    const blocked=await f.api('/submissions','author',{metadata,package:pack,catalogCover:cover});
+    expect(blocked.status).toBe(429);expect(JSON.stringify(blocked.value)).toContain('200');
+    f.db.prepare('UPDATE submissions SET deleted_at=1 WHERE id=?').run('quota-1');
+    await f.submit();
+  });
   it('目录发布后清理旧文件失败，重试仍移除已撤回的公开文件',async()=>{
     const f=await fixture(),one=await f.submit();await f.approve(one.revision);await f.fire();
     const entry=f.snapshot().entries[0];

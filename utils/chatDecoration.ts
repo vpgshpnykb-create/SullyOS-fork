@@ -1,5 +1,8 @@
+import {validateCollaborationAppearance, type CollaborationAppearance} from '../features/collaboration/appearance';
 import {validateMeetingAppearance, type MeetingAppearance} from './meetingAppearance';
+import {validateProfileAppearance,type ChatProfileAppearance} from './chatProfileAppearance';
 import {validateJournalAppearance} from './journalAppearance';
+import {localizeCssImages,portableCssImages} from './cssImageAssets';
 import {validateScheduleAppearance} from './scheduleAppearance';
 import {resolvePsycheAppearance,validatePsycheAppearance,type PsycheAppearance} from './psycheAppearance';
 import type {CharacterProfile,OSTheme,ChatTheme,ScheduleCardAppearance,JournalAppearance} from '../types';
@@ -7,17 +10,21 @@ import {mergeChatFineTune} from './chatFineTuneCss';
 import {resolveActiveSound,stripWhiteboxSoundDirective,decodeSoundShare,parseWhiteboxSound,BUILTIN_SOUNDS} from './whiteboxSound';
 import {resolveRefToDataUrl,blobToDataUrl,migrateDataUrlToRef,migrateChatThemeBlobRefs} from './blobRef';
 import {extractShareFromPng,isPng,pngHasShare,SHARE_KINDS} from './pngShare';
+import {mergeAvatarFrameCss} from './avatarFrameTarget';
 import {replaceWorkshopCss,workshopBlock} from './decorationWorkshop';
 
 // Explicit allowlist: presets never carry API keys, character prompts, history or system settings.
 export const LAYOUT_DEFAULTS = {
  chatAvatarMode:'grouped',chatEmojiSize:'small',chatAvatarShape:'circle',chatAvatarSize:'medium',chatAvatarVisibility:'both',chatAvatarPlacement:'beside',chatAvatarAlign:'bottom',chatAvatarOffsetY:0,
  chatBubbleFontSize:0,chatBubbleLineHeight:0,chatBubbleIndent:0,chatSnapToEdge:false,chatModuleAlign:'center',
- chatBubbleStyle:'modern',chatMessageSpacing:'default',chatShowTimestamp:'always',chatHeaderStyle:'default',chatInputStyle:'rounded',chatChromeStyle:'soft',
+ chatBubbleStyle:'modern',chatMessageSpacing:'default',chatShowTimestamp:'always',chatTimestampPosition:'below',chatHeaderStyle:'default',chatInputStyle:'rounded',chatChromeStyle:'soft',
  chatHeaderAlign:'left',chatHeaderDensity:'default',chatStatusStyle:'subtle',chatSendButtonStyle:'circle',chatHideHeaderBuffs:false,
 } satisfies Partial<OSTheme>;
+export const DEFAULT_AVATAR_POSITION = {
+ chatAvatarPlacement:LAYOUT_DEFAULTS.chatAvatarPlacement,chatAvatarAlign:LAYOUT_DEFAULTS.chatAvatarAlign,chatAvatarOffsetY:0,
+};
 export type DecorationLayout=Partial<Pick<OSTheme,keyof typeof LAYOUT_DEFAULTS>>;
-const choices:Record<string,string[]>={chatAvatarMode:['grouped','every_message'],chatEmojiSize:['small','medium','large'],chatAvatarShape:['circle','rounded','square'],chatAvatarSize:['small','medium','large'],chatAvatarVisibility:['both','hide_ai','hide_user','hide_both'],chatAvatarPlacement:['beside','above_group'],chatAvatarAlign:['bottom','top','center'],chatModuleAlign:['anchor','center'],chatBubbleStyle:['modern','flat','outline','shadow','wechat','ios'],chatMessageSpacing:['compact','default','spacious'],chatShowTimestamp:['always','hover','never'],chatHeaderStyle:['default','minimal','gradient','wechat','telegram','discord','pixel'],chatInputStyle:['default','rounded','flat','wechat','ios','telegram','discord','pixel'],chatChromeStyle:['soft','flat','floating','pixel'],chatHeaderAlign:['left','center'],chatHeaderDensity:['compact','default','airy'],chatStatusStyle:['subtle','pill','dot'],chatSendButtonStyle:['circle','pill','minimal']};
+const choices:Record<string,string[]>={chatAvatarMode:['grouped','every_message'],chatEmojiSize:['small','medium','large'],chatAvatarShape:['circle','rounded','square'],chatAvatarSize:['small','medium','large'],chatAvatarVisibility:['both','hide_ai','hide_user','hide_both'],chatAvatarPlacement:['beside','above_group'],chatAvatarAlign:['bottom','top','center'],chatModuleAlign:['anchor','center'],chatBubbleStyle:['modern','flat','outline','shadow','wechat','ios'],chatMessageSpacing:['compact','default','spacious'],chatShowTimestamp:['always','hover','never'],chatTimestampPosition:['below','below_avatar','top_center'],chatHeaderStyle:['default','minimal','gradient','wechat','telegram','discord','pixel'],chatInputStyle:['default','rounded','flat','wechat','ios','telegram','discord','pixel'],chatChromeStyle:['soft','flat','floating','pixel'],chatHeaderAlign:['left','center'],chatHeaderDensity:['compact','default','airy'],chatStatusStyle:['subtle','pill','dot'],chatSendButtonStyle:['circle','pill','minimal']};
 const record=(v:unknown):v is Record<string,any>=>!!v&&typeof v==='object'&&!Array.isArray(v);
 export function pickDecorationLayout(value:unknown):DecorationLayout{
  if(!record(value))throw Error('布局内容无效');const result:Record<string,unknown>={};
@@ -29,9 +36,9 @@ export function pickDecorationLayout(value:unknown):DecorationLayout{
 export function resolveDecorationTheme(theme:OSTheme,char?:CharacterProfile):OSTheme{
  return {...theme,...pickDecorationLayout(char?.chatFineTune?.enabled===false?{}:char?.chatAppearance||{}),...(['plain','grid','paper','mesh'].includes(char?.chatAppearance?.chatBackgroundStyle||'')?{chatBackgroundStyle:char!.chatAppearance!.chatBackgroundStyle}:{}),...(char?.chatDecorationCssIsolated?{chatChromeCustomCss:undefined}:{})};
 }
-export const PART_LABELS={layout:'布局',bubbles:'气泡',background:'背景',sound:'声音',date:'见面界面',story:'剧情界面（全局）',css:'白框 CSS',psyche:'心象卡片',schedule:'日程表（全局）',journal:'交换日记'} as const;
+export const PART_LABELS={profile:'角色名片',collaboration:'协同工作（全局）',layout:'布局',bubbles:'气泡',background:'背景',sound:'声音',date:'见面界面',story:'剧情界面（全局）',css:'白框 CSS',psyche:'心象卡片',schedule:'日程表（全局）',journal:'交换日记'} as const;
 export type DecorationPart=keyof typeof PART_LABELS;
-export interface DecorationPreset{format:'sullyos-chat-decoration';version:1;name:string;parts:{date?:MeetingAppearance;story?:MeetingAppearance;journal?:JournalAppearance;schedule?:ScheduleCardAppearance;psyche?:PsycheAppearance;layout?:DecorationLayout;bubbles?:ChatTheme;background?:{image:string|null;style:OSTheme['chatBackgroundStyle']};sound?:{src:string;volume?:number}|null;css?:string}}
+export interface DecorationPreset{format:'sullyos-chat-decoration';version:1;name:string;parts:{profile?:ChatProfileAppearance;collaboration?:CollaborationAppearance;date?:MeetingAppearance;story?:MeetingAppearance;journal?:JournalAppearance;schedule?:ScheduleCardAppearance;psyche?:PsycheAppearance;layout?:DecorationLayout;bubbles?:ChatTheme;background?:{image:string|null;style:OSTheme['chatBackgroundStyle']};sound?:{src:string;volume?:number}|null;css?:string}}
 function resource(value:unknown):string{
  if(typeof value!=='string'||value.length>40*1024*1024||!(/^(data:(image|audio)\/[\w.+-]+[;,]|https?:\/\/)/i.test(value)))throw Error('资源不是可分享的图片或音频，请重新导出原文件');return value;
 }
@@ -56,15 +63,17 @@ export function validateDecoration(value:unknown):DecorationPreset{
  if((p.schedule!==undefined||p.journal!==undefined)&&Object.keys(p).some(key=>key!=='schedule'&&key!=='journal'))throw Error('App 美化与聊天装扮请分别保存');
  if(p.schedule!==undefined&&p.journal!==undefined)throw Error('不同 App 的美化请分别保存');
  if((p.date!==undefined||p.story!==undefined)&&Object.keys(p).length!==1)throw Error('见面与剧情界面美化请单独保存');
+ if(p.collaboration!==undefined){if(Object.keys(p).length!==1)throw Error('协同工作美化请单独保存');result.parts.collaboration=validateCollaborationAppearance(p.collaboration);}
  if(p.date!==undefined)result.parts.date=validateMeetingAppearance(p.date);
  if(p.story!==undefined)result.parts.story=validateMeetingAppearance(p.story);
+ if(p.profile!==undefined)result.parts.profile=validateProfileAppearance(p.profile);
  if(p.journal!==undefined)result.parts.journal=validateJournalAppearance(p.journal);
  if(p.schedule!==undefined)result.parts.schedule=validateScheduleAppearance(p.schedule);
  if(p.psyche!==undefined)result.parts.psyche=validatePsycheAppearance(p.psyche);
  if(p.layout!==undefined)result.parts.layout=pickDecorationLayout(p.layout);
  if(p.bubbles!==undefined)result.parts.bubbles=validateBubble(p.bubbles);
  if(p.background!==undefined){if(!record(p.background)||!['plain','grid','paper','mesh'].includes(p.background.style))throw Error('背景格式无效');result.parts.background={image:p.background.image===null?null:resource(p.background.image),style:p.background.style};}
- if(p.sound!==undefined){if(p.sound===null)result.parts.sound=null;else{if(!record(p.sound)||typeof p.sound.src!=='string')throw Error('提示音格式无效');const src=p.sound.src;if(src!=='none'&&!Object.hasOwn(BUILTIN_SOUNDS,src))resource(src);if(p.sound.volume!==undefined&&(typeof p.sound.volume!=='number'||p.sound.volume<0||p.sound.volume>1))throw Error('音量无效');result.parts.sound={src,volume:p.sound.volume??.6};}}
+ if(p.sound!==undefined){if(p.sound===null)result.parts.sound=null;else{if(!record(p.sound)||typeof p.sound.src!=='string')throw Error('提示音格式无效');const src=p.sound.src;if(src!=='none'&&!Object.prototype.hasOwnProperty.call(BUILTIN_SOUNDS,src))resource(src);if(p.sound.volume!==undefined&&(typeof p.sound.volume!=='number'||p.sound.volume<0||p.sound.volume>1))throw Error('音量无效');result.parts.sound={src,volume:p.sound.volume??.6};}}
  if(p.css!==undefined){if(typeof p.css!=='string'||p.css.length>8*1024*1024||/<\/?(?:script|html|iframe)\b/i.test(p.css))throw Error('CSS 内容无效');result.parts.css=p.css;}
  if(!Object.keys(result.parts).length)throw Error('预设中没有可用的装扮内容');
  return result;
@@ -77,6 +86,7 @@ async function portable(value:string):Promise<string>{
 async function portableTree(value:any):Promise<any>{
  if(typeof value==='string'){
   if(/^(blobref:|blob:)/.test(value)||/^(\/(?![/*])|\.\.?\/)[^\s{}]+$/.test(value))return portable(value);
+  value=await portableCssImages(value);
   const matches=[...value.matchAll(/url\(\s*['"]?((?:blobref:|blob:|\/|\.\.?\/)[^'"\s)]+)['"]?\s*\)/g)];
   for(const m of matches)value=value.replace(m[0],`url("${await portable(m[1])}")`);
   return value;
@@ -90,15 +100,22 @@ export function readBubbleDecoration(bubbles:ChatTheme):Promise<DecorationPreset
  return portableDecoration({format:'sullyos-chat-decoration',version:1,name:bubbles.name,parts:{bubbles}});
 }
 export async function exportDecoration(name:string,theme:OSTheme,char:CharacterProfile|undefined,bubble:ChatTheme):Promise<DecorationPreset>{
+ const result=await portableDecoration(await snapshotDecoration(name,theme,char,bubble));
+ if(new Blob([JSON.stringify(result)]).size>40*1024*1024)throw Error('整套素材超过 40 MB，请精简背景或气泡图片后导出');return result;
+}
+/** Editable snapshot keeps primary CSS assets in IndexedDB. */
+export async function snapshotDecoration(name:string,theme:OSTheme,char:CharacterProfile|undefined,bubble:ChatTheme):Promise<DecorationPreset>{
  const effective=resolveDecorationTheme(theme,char);
  const layout=char?{...effective,...mergeChatFineTune(effective,char.chatFineTune)}:theme;
  const css=[effective.chatChromeCustomCss,char?.chromeCustomCss].filter(Boolean).join('\n');
  const preset:DecorationPreset={format:'sullyos-chat-decoration',version:1,name,parts:{
+  ...((char?.chatProfileAppearance||theme.chatProfileAppearance)?{profile:char?.chatProfileAppearance||theme.chatProfileAppearance}:{}),
   psyche:resolvePsycheAppearance(theme,char),
   layout:{...LAYOUT_DEFAULTS,...pickDecorationLayout(layout)},bubbles:structuredClone(bubble),background:{image:(char?.chatBackground??theme.chatBackground)||null,style:effective.chatBackgroundStyle||'plain'},
   sound:resolveActiveSound(char?.chromeCustomCss,char?.chatSound,effective.chatChromeCustomCss,theme.chatSound),css:stripWhiteboxSoundDirective(css),
  }};
- const result=validateDecoration(await portableTree(preset));if(new Blob([JSON.stringify(result)]).size>40*1024*1024)throw Error('整套素材超过 40 MB，请精简背景或气泡图片后导出');return result;
+ const {css:primaryCss,...other}=preset.parts;
+ return validateDecoration({...preset,parts:{...await portableTree(other),css:primaryCss}});
 }
 export type DecorationImport={kind:'preset';preset:DecorationPreset}|{kind:'image';image:string;name:string};
 export function parseDecorationText(text:string,name='导入的装扮'):DecorationPreset{
@@ -115,21 +132,40 @@ export async function readDecorationFile(file:File):Promise<DecorationImport>{
  if(isPng(bytes)||/^image\/(jpeg|webp|gif|avif|bmp)$/.test(file.type))return {kind:'image',image:await blobToDataUrl(new Blob([bytes],{type:isPng(bytes)?'image/png':file.type})),name:file.name.replace(/\.[^.]+$/,'')};
  return {kind:'preset',preset:parseDecorationText(await file.text(),file.name.replace(/\.[^.]+$/,''))};
 }
-export async function decorationPatches(preset:DecorationPreset,parts:DecorationPart[],scope:'global'|'character',char:CharacterProfile,base:OSTheme){
+export async function decorationPatches(preset:DecorationPreset,parts:DecorationPart[],scope:'global'|'character',char:CharacterProfile,base:OSTheme,mode:'apply'|'trial'='apply'){
  const p=validateDecoration(preset).parts,character:Partial<CharacterProfile>={},theme:Partial<OSTheme>={};let bubble:ChatTheme|undefined;
+ if(parts.includes('profile')&&p.profile){const value={customCss:mode==='trial'?p.profile.customCss:await localizeCssImages(p.profile.customCss)};if(scope==='global')theme.chatProfileAppearance=value;else character.chatProfileAppearance=value;}
  if(parts.includes('date')&&p.date)character.dateAppearance={...p.date,name:preset.name};
  if(parts.includes('story')&&p.story)theme.storyAppearance={...p.story,name:preset.name};
  if(parts.includes('journal')&&p.journal)theme.journalAppearance=p.journal;
  if(parts.includes('schedule')&&p.schedule)theme.scheduleCardAppearance=p.schedule;
  if(parts.includes('psyche')&&p.psyche){if(scope==='global')theme.chatPsyche=p.psyche;else{character.thinkingChainStyle=p.psyche.styleId;character.thinkingChainCustomColors={bg:'#1f2937',accent:'#fbbf24',text:'#f1f5f9',...p.psyche.customColors};character.thinkingChainCustomCss=p.psyche.customCss||'';}}
  if(parts.includes('layout')&&p.layout){if(scope==='global')Object.assign(theme,LAYOUT_DEFAULTS,p.layout);else{character.chatAppearance={...LAYOUT_DEFAULTS,...p.layout,...(char.chatAppearance?.chatBackgroundStyle?{chatBackgroundStyle:char.chatAppearance.chatBackgroundStyle}:{})};character.chatFineTune={enabled:true};}}
- if(parts.includes('bubbles')&&p.bubbles){bubble=await migrateChatThemeBlobRefs({...p.bubbles,id:'decoration-'+crypto.randomUUID(),type:'custom'});if(scope==='global')theme.chatDefaultBubbleStyle=bubble.id;else character.bubbleStyle=bubble.id;}
- if(parts.includes('background')&&p.background){const ref=p.background.image?await migrateDataUrlToRef(p.background.image):'';if(scope==='global'){theme.chatBackground=ref;theme.chatBackgroundStyle=p.background.style;}else{character.chatBackground=ref;character.chatAppearance={...(character.chatAppearance||char.chatAppearance),chatBackgroundStyle:p.background.style};}}
+ if(parts.includes('bubbles')&&p.bubbles){bubble={...p.bubbles,id:'decoration-'+crypto.randomUUID(),type:'custom'};if(mode==='apply')bubble=await migrateChatThemeBlobRefs(bubble);if(scope==='global')theme.chatDefaultBubbleStyle=bubble.id;else character.bubbleStyle=bubble.id;}
+ if(parts.includes('background')&&p.background){const ref=p.background.image?(mode==='trial'?p.background.image:await migrateDataUrlToRef(p.background.image)):'';if(scope==='global'){theme.chatBackground=ref;theme.chatBackgroundStyle=p.background.style;}else{character.chatBackground=ref;character.chatAppearance={...(character.chatAppearance||char.chatAppearance),chatBackgroundStyle:p.background.style};}}
  if(parts.includes('css')&&p.css!==undefined){
   const blocks=[...p.css.matchAll(/\/\* sully-composer:(avatar|background) \*\/\n?([\s\S]*?)\/\* end-sully-composer:\1 \*\//g)];
-  const scopedOnly=blocks.length>0&&!p.css.replace(workshopBlock('avatar'),'').replace(workshopBlock('background'),'').trim();
+  const extraCss=p.css.replace(workshopBlock('avatar'),'').replace(workshopBlock('background'),'').trim();
+  const isFullOutfit=Boolean(p.layout||extraCss||Object.keys(p).filter(key=>key!=='css').length>1);
+  const scopedOnly=!isFullOutfit&&blocks.length>0;
+  // Legacy whiteboxes often position avatars in CSS without declaring a layout.
+  if(!p.layout && extraCss){
+   if(scope==='global')Object.assign(theme,DEFAULT_AVATAR_POSITION);
+   else {
+    const enabled=char.chatFineTune?.enabled;
+    const previousLayout=enabled===false?{chatBackgroundStyle:char.chatAppearance?.chatBackgroundStyle}:char.chatAppearance;
+    character.chatAppearance={...previousLayout,...(character.chatAppearance?{chatBackgroundStyle:character.chatAppearance.chatBackgroundStyle}:{}),...DEFAULT_AVATAR_POSITION};
+    character.chatFineTune={...(enabled?char.chatFineTune:{}),enabled:true};
+    for(const key of Object.keys(DEFAULT_AVATAR_POSITION) as (keyof typeof DEFAULT_AVATAR_POSITION)[])delete character.chatFineTune[key];
+   }
+  }
   let appliedCss=p.css;
-  if(scopedOnly){appliedCss=scope==='global'?base.chatChromeCustomCss||'':char.chromeCustomCss||'';for(const block of blocks)appliedCss=replaceWorkshopCss(appliedCss,block[1] as 'avatar'|'background',block[2]);}
+  if(scopedOnly){
+   appliedCss=scope==='global'?base.chatChromeCustomCss||'':char.chromeCustomCss||'';
+   if(blocks.some(block=>block[1]==='avatar'))appliedCss=mergeAvatarFrameCss(appliedCss,p.css);
+   for(const block of blocks)if(block[1]==='background')appliedCss=replaceWorkshopCss(appliedCss,'background',block[2]);
+  }
+  if(mode==='apply')appliedCss=await localizeCssImages(appliedCss);
   // Importing just CSS must not silently change the current sound stored in a CSS comment.
   const keep=scope==='global'?resolveActiveSound(undefined,undefined,base.chatChromeCustomCss,base.chatSound):resolveActiveSound(char.chromeCustomCss,char.chatSound,base.chatChromeCustomCss,base.chatSound);
   if(scope==='global'){theme.chatChromeCustomCss=stripWhiteboxSoundDirective(appliedCss);theme.chatSound=keep||{src:'none'};}

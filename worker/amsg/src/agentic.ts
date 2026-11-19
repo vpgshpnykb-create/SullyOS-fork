@@ -28,10 +28,12 @@ import {
   type McpResolvedToolCore,
 } from '../../../utils/mcpFireCore';
 import { sanitizeIntoSegments } from '../../../utils/sanitize';
+import { AMSG_SILENT_MARK } from '../../../utils/amsgFirePack';
 import {
   AMSG_FIRE_SCHEDULE_TOOL,
   extractFireScheduleTextCalls,
 } from '../../../utils/amsgFireSchedule';
+import { mergeToolRoundLeadIns } from '../../../utils/amsg2ToolLoop';
 // type-only：编译期擦除，不会把 realtimeContext 的浏览器依赖打进 worker bundle。
 import type { XhsNote } from '../../../utils/realtimeContext';
 import {
@@ -234,7 +236,8 @@ export type RoundDecision =
   /** reason 直接进 last_skip，面板照实告诉用户那次为什么没响。 */
   | {
       decision: 'skip-push';
-      reason: 'empty-generation' | 'side-effects-only';
+      reason: 'declined' | 'empty-generation' | 'side-effects-only';
+      sideEffects?: { directives: Directive[]; xhsSession?: XhsSessionPayload };
       /**
        * 这一轮被整条丢掉、但仍要送到客户端的日程改动（没有就没有这个字段）。
        * 别的副作用丢了就丢了，日程不行——理由见下面 skip-push 那处的注释。
@@ -453,7 +456,9 @@ export function processLLMRound(
   // 这里再拼一次 llmOutputText 就会重复一段（而且它还带着那个转不出来的数据标签）。
   const thisRound = isToolRound ? '' : restoreSurfaces(scanText);
   const rounds = [...state.narrations, thisRound].filter((part) => part.trim().length > 0);
-  const fullText = rounds.join('\n');
+  const fullText = state.narrations.length > 0
+    ? mergeToolRoundLeadIns(state.narrations, thisRound)
+    : thisRound;
   // SAR 信封在这里拆：旁白本来就一轮一份，逐轮拆、逐轮降级（某一轮没守信封就原文照发），
   // 各轮真意再按顺序拼。之后的 classify / 分段 / directives 全部只认真意；外显绝不 classify。
   const sarParse: SarEnvelopeParse | null = sarPlan?.requiresEnvelope
@@ -480,7 +485,10 @@ export function processLLMRound(
   const finishMeta = directives.length > 0
     ? { directives, ...(xhsSession ? { xhsSession } : {}) }
     : undefined;
-  const segments = sanitizeIntoSegments(cleanedText);
+  // 角色决定这次不说（见 AMSG_SILENT_MARK）。标记出现在哪一轮都算数：说了不发就整条
+  // 不发，标记旁边多写的话是它在解释自己为什么不说，不是要发给对方的。
+  const declined = fullText.includes(AMSG_SILENT_MARK);
+  const segments = declined ? [] : sanitizeIntoSegments(cleanedText);
 
   if (segments.length === 0) {
     // 没有正文就整条不发，这轮有没有副作用都一样。
@@ -503,7 +511,8 @@ export function processLLMRound(
       .map((d) => ({ startTime: d.time, activity: d.activity }));
     return {
       decision: 'skip-push',
-      reason: finishMeta ? 'side-effects-only' : 'empty-generation',
+      reason: declined ? 'declined' : finishMeta ? 'side-effects-only' : 'empty-generation',
+      ...(!declined && directives.some(d => d.type !== 'change_schedule') && finishMeta ? { sideEffects: finishMeta } : {}),
       ...(scheduleChanges.length > 0 ? { scheduleChanges } : {}),
     };
   }

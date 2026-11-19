@@ -141,9 +141,16 @@ type DesktopSkinOption = { id: string; name: string; desc: string; swatch: strin
 
 const DESKTOP_SKINS: DesktopSkinOption[] = [
   {
+    id: 'homely',
+    name: '居家',
+    desc: '小屋日常同步 · 面对面聊天 · 家园小手机',
+    swatch: 'linear-gradient(90deg,#ebc2a1 0%,#f4dfcc 48%,#faf3e7 48%,#fffaf2 100%)',
+    config: { skin: 'homely', wallpaper: 'linear-gradient(180deg,#faf3e7,#ebc2a1)', contentColor: '#695344' },
+  },
+  {
     id: 'animalcrossing',
-    name: '动森风格',
-    desc: 'NookPhone 彩色图标 · 草地天空 · 暖色界面',
+    name: '森间手记',
+    desc: '手绘彩色图标 · 草地天空 · 暖色界面',
     swatch: 'linear-gradient(135deg,#BCE7F5 0%,#BBE38F 55%,#7CBA4C 100%)',
     config: {
       skin: 'animalcrossing',
@@ -483,6 +490,7 @@ const PresetManager: React.FC<PresetManagerProps> = ({ presets, onSave, onApply,
 const Appearance: React.FC = () => {
   const { theme, updateTheme, closeApp, openApp, setCustomIcon, customIcons, addToast, appearancePresets, saveAppearancePreset, applyAppearancePreset, deleteAppearancePreset, renameAppearancePreset, exportAppearancePreset, importAppearancePreset, characters, activeCharacterId, updateCharacter } = useOS();
   const [activeTab, setActiveTab] = useState<'theme' | 'icons' | 'presets' | 'sharing'>(() => (hasBeautyReceiveRequest()||hasBeautyLibraryRequest()) ? 'sharing' : 'theme');
+  useAppShortcut(ShortcutAppID.Appearance, intent => setActiveTab((intent.entryId || 'theme') as typeof activeTab));
   const [shareBusy, setShareBusy] = useState(false);
   const wallpaperInputRef = useRef<HTMLInputElement>(null);
   const [wallpaperUrl, setWallpaperUrl] = useState('');
@@ -776,6 +784,8 @@ const Appearance: React.FC = () => {
       reader.onload = async (ev) => {
           try {
               const dataUrl = ev.target?.result as string;
+              const { rememberFontDataUrl } = await import('../utils/fontLibrary');
+              await rememberFontDataUrl(dataUrl, file.name.replace(/\.[^.]+$/, ''));
               updateTheme({ customFont: dataUrl });
               addToast('系统字体已更新', 'success');
           } catch(err) {
@@ -973,13 +983,13 @@ const Appearance: React.FC = () => {
                     {(theme.skin || 'default') === 'animalcrossing' && (
                         <div className="mt-4 flex items-center justify-between gap-3 rounded-2xl bg-slate-50 border border-slate-100 px-4 py-3">
                             <div className="min-w-0">
-                                <div className="text-xs font-bold text-slate-700">聊天界面跟随动森</div>
+                                <div className="text-xs font-bold text-slate-700">聊天界面跟随森间手记</div>
                                 <div className="text-[10px] text-slate-400 mt-0.5 leading-snug">关掉后，聊天 App 保持原来的样式</div>
                             </div>
                             <button
                                 onClick={() => updateTheme({ acnhChatSync: theme.acnhChatSync === false ? true : false })}
                                 className={`relative w-11 h-6 rounded-full shrink-0 transition-colors ${theme.acnhChatSync !== false ? 'bg-primary' : 'bg-slate-300'}`}
-                                aria-label="聊天界面跟随动森"
+                                aria-label="聊天界面跟随森间手记"
                             >
                                 <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${theme.acnhChatSync !== false ? 'translate-x-5' : ''}`} />
                             </button>
@@ -1781,3 +1791,5 @@ const Appearance: React.FC = () => {
 };
 
 export default Appearance;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

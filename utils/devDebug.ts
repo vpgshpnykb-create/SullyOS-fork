@@ -1,3 +1,5 @@
+import { redactRelayTokensInText, sanitizeUrlForLog } from './networkRequestSource';
+
 // ===== 捕获类别（分类日志的"单一真理源"）=====
 // 加新类只动这里：
 //   1. 在 DevDebugCaptureCategory 加一个字面量
@@ -46,6 +48,8 @@ export interface DevDebugFlags {
     sarExpressionReview: boolean;
     skipPromptBuild: boolean;
     skipEmotionEval: boolean;
+    /** 临时测试：秘密任务跳过概率抽签，其余前置条件不变。 */
+    forceHomeSecretRoll: boolean;
     /**
      * 把聊天请求里的多条 role:system 合并成开头一条再发送（utils/systemMessageMerge.ts）。
      * 排查逆向中转对「历史后 system」重复拼接导致 prompt_tokens 膨胀的兼容问题；
@@ -100,6 +104,7 @@ export const DEFAULT_DEV_DEBUG_FLAGS: DevDebugFlags = {
     sarExpressionReview: false,
     skipPromptBuild: false,
     skipEmotionEval: false,
+    forceHomeSecretRoll: false,
     mergeSystemMessages: false,
     captureEnabled: false,
     captureLogs: [],
@@ -113,7 +118,7 @@ const MAX_LOG_STORAGE_CHARS = 1_000_000;
 // 免得 reason / outcome / status 这种关键短字符串也被截掉。
 // messages 数组本身整个换成 ["…共 N 项（已折叠）"]，一条都不留——首条 system prompt 体积通常很大，
 // 留着没省到多少空间，要看就开「记录完整内容」。
-const SECRET_KEY_PATTERN = /(api[-_]?key|authorization|bearer|token|secret|endpoint|p256dh|auth)$/i;
+const SECRET_KEY_PATTERN = /(?:api[-_]?key|authorization|bearer|token|secret|endpoint|p256dh|auth|password|passwd|cookie|device[-_]?key|(?:^|[-_])spt|amap[-_]?key|geoapify[-_]?key)$/i;
 let memoryLog: DevDebugLogEntry[] | null = null;
 
 function normalizeStorageKeyPart(value: string): string {
@@ -155,6 +160,7 @@ function normalizeFlags(value: unknown): DevDebugFlags {
         skipPromptBuild: source.skipPromptBuild === true,
         sarExpressionReview: source.sarExpressionReview === true,
         skipEmotionEval: source.skipEmotionEval === true,
+        forceHomeSecretRoll: source.forceHomeSecretRoll === true,
         mergeSystemMessages: source.mergeSystemMessages === true,
         captureEnabled: source.captureEnabled === true || legacyHasCapture,
         captureLogs,
@@ -277,6 +283,10 @@ export function isEmotionEvalSkipped(): boolean {
     return readDevDebugFlags().skipEmotionEval;
 }
 
+export function isHomeSecretRollForced(): boolean {
+    return readDevDebugFlags().forceHomeSecretRoll;
+}
+
 export function isSystemMessageMergeEnabled(): boolean {
     return readDevDebugFlags().mergeSystemMessages;
 }
@@ -297,8 +307,11 @@ export function redactDevDebugSecrets(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(redactDevDebugSecrets);
     // Multimodal requests may contain a one-frame camera data URL. Debug logs
     // keep its size signal via requestChars, never the actual private pixels.
-    if (typeof value === 'string' && /^data:image\/[a-z0-9.+-]+;base64,/i.test(value)) {
-        return `<image data omitted · ${value.length} chars>`;
+    if (typeof value === 'string') {
+        if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(value)) {
+            return `<image data omitted · ${value.length} chars>`;
+        }
+        return redactRelayTokensInText(value);
     }
     if (!value || typeof value !== 'object') return value;
 
@@ -318,7 +331,7 @@ function safeJsonValue(value: unknown): unknown {
     try {
         return redactDevDebugSecrets(JSON.parse(JSON.stringify(value)));
     } catch {
-        return String(value);
+        return redactRelayTokensInText(String(value));
     }
 }
 
@@ -429,7 +442,7 @@ export function appendDevDebugLog(category: DevDebugCaptureCategory, input: { la
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             timestamp: new Date().toISOString(),
             category,
-            label: input.label,
+            label: typeof input.label === 'string' ? redactRelayTokensInText(input.label) : input.label,
             collapsed: !exposed,
             data: exposed ? safeData : collapseMessagesInData(safeData),
         };
@@ -473,12 +486,14 @@ function measureRequestChars(body: unknown): number | undefined {
 
 /** 通用 HTTP 日志薄封装；按 category 落到对应类别，请求体 / 错误统一整形。 */
 function appendDevDebugHttpLog(category: DevDebugCaptureCategory, input: DevDebugHttpLogInput): void {
+    if (!isCaptureEnabled(category)) return;
+    const safeUrl = sanitizeUrlForLog(input.url);
     // label 前缀加分类——不同类别的请求 url 可能一字不差（都是 baseUrl + /chat/completions），
     // 不带前缀的话导出 JSON 里两类条目肉眼分不清。
     appendDevDebugLog(category, {
-        label: `[${category}] ${input.method ?? 'POST'} ${input.url}`,
+        label: `[${category}] ${input.method ?? 'POST'} ${safeUrl}`,
         data: {
-            url: input.url,
+            url: safeUrl,
             method: input.method,
             status: input.status,
             durationMs: input.durationMs,

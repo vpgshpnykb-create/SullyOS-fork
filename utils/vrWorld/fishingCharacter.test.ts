@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { applyMarketPlan, buildMarketTurn, flushMarketReceipts, marketReceiptContent, parseFishingReaction, parseMarketPlan } from './fishingCharacter';
 import { addCatchToState, createListing, createRequest, createFishingMarketState, ensureActorAccounts, logMarketEvent, readFishingMarketState, saveFishingMarketState } from './fishingMarket';
 import { DB } from '../db';
-vi.mock('../db',()=>({DB:{getVRCardsByCharId:vi.fn(async()=>[]),saveMessageOnce:vi.fn(async()=>1)}}));
+vi.mock('../db',()=>({DB:{getVRMarketEventIds:vi.fn(async()=>[]),saveMessageOnce:vi.fn(async()=>1)}}));
 beforeEach(()=>{localStorage.clear();vi.clearAllMocks();});
 it('requires structured reaction; missing content never becomes fabricated action',()=>{
     expect(parseFishingReaction('我钓到太阳了')).toBeNull();expect(parseMarketPlan('<PRICE>NaN</PRICE><NOTE>看板</NOTE>')).toBeNull();
@@ -41,4 +41,10 @@ it('distinguishes text goods from real specimens and uses the model-selected cat
     const next=applyMarketPlan(s,a,plan);
     expect(next.inventory.find(c=>c.id==='chosen')?.ownerId).toBe(b.id);
     expect(next.inventory.find(c=>c.id==='first')?.ownerId).toBe(a.id);
+});
+
+it('reads one JSON board decision or the legacy tags; an unknown action cannot become a browse',()=>{
+    expect(parseMarketPlan('决定如下：\n{"action":"sell","catchIds":["fish-1"],"price":null,}')).toMatchObject({action:'sell',catchIds:['fish-1']});
+    expect(parseMarketPlan('<ACTION>sell</ACTION><CATCH>fish-1</CATCH><PRICE>留空</PRICE>')).toMatchObject({action:'sell',catchIds:['fish-1']});
+    for (const text of ['<NOTE>绕了一圈</NOTE>','<ACTION>unknown</ACTION><NOTE>看一眼</NOTE>', '{"action":"sell","catchIds":["one","one"]}','{"action":"list","catchId":"x"}']) expect(parseMarketPlan(text)).toBeNull();
 });

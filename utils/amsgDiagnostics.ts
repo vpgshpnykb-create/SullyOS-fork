@@ -16,7 +16,9 @@ import type {
   AmsgTickReportFailure,
   AmsgTickReportTask,
 } from './amsgTickReport';
+import { CLOUD_CLEANUP_STAGE } from './amsgTickReport';
 import { describeTaskFailureCause } from './amsg2Tasks';
+import { describeD1LimitCode } from './amsgD1Limits';
 
 // ─── 失败归类（给使用统计分档用）───
 //
@@ -119,14 +121,14 @@ export const describeAmsgFetchFailure = (
   if (looksLikeTimeoutError(raw, name)) {
     return {
       kind: '网络失败',
-      message: `主动消息 2.0 的${phase}请求等太久，超时了${where}。多半是当前网络到 Cloudflare 很慢或中途被掐断，稍后重试即可；一直这样的话，用设置面板里的「Deno 门面」换一条线路。\n到点的主动消息推送不走这条路，不受影响。`,
+      message: `主动消息 2.0 的${phase}请求等太久，超时了${where}。多半是当前网络到 Cloudflare 很慢或中途被掐断，稍后重试即可；一直这样的话，换个网络，或者照设置面板里 Worker 地址下面的「直连教程」配一下。\n到点的主动消息推送不走这条路，不受影响。`,
     };
   }
 
   if (looksLikeOfflineError(raw, name)) {
     return {
       kind: '网络失败',
-      message: `连不上你的 Worker${where}，${phase}没能完成。\n这一步是这台设备直接去连 Cloudflare，常见原因有三个：当前网络到 Cloudflare 不通（换个网络，或用设置面板里的「Deno 门面」套一层）、Worker 地址填错了、Worker 已经被删掉了。\n到点的主动消息推送是 Cloudflare 直接发给设备的，不走这条路，所以照常收得到。`,
+      message: `连不上你的 Worker${where}，${phase}没能完成。\n这一步是这台设备直接去连 Cloudflare，常见原因有三个：当前网络到 Cloudflare 不通（换个网络，或者照设置面板里 Worker 地址下面的「直连教程」配一下）、Worker 地址填错了、Worker 已经被删掉了。\n到点的主动消息推送是 Cloudflare 直接发给设备的，不走这条路，所以照常收得到。`,
     };
   }
 
@@ -293,6 +295,8 @@ export interface AmsgDiagnosticsInput {
   probe: AmsgDiagnosticsProbe;
   /** 这台设备的浏览器有没有推送订阅（本地事实，worker 那侧看不到）。 */
   localPushSubscribed?: boolean;
+  /** 当前选择的推送模式：第三方推送不需要浏览器 VAPID。 */
+  pushMode?: 'web-push' | 'third-party';
   /** 把 epoch 毫秒写成给人看的时间；不传按本机习惯格式化（单测注入固定格式用）。 */
   formatTime?: (atMs: number) => string;
   /** 定时任务的逐条细账。没拉（null / 不传）时「定时任务」那一行只按 /debug 的两个数说话。 */
@@ -512,6 +516,7 @@ const describeTickTask = (task: AmsgTickReportTask, ctx: TickTaskContext): AmsgD
 const TICK_STAGE_TEXT: Record<string, string> = {
   config: '读配置那一步',
   tick: '整轮处理任务那一步',
+  [CLOUD_CLEANUP_STAGE]: '清理云端数据那一步',
   claim_failed: '给任务占位写库那一步',
   retry_update_failed: '记失败原因写库那一步',
   stale_update_failed: '处理过期任务写库那一步',
@@ -525,6 +530,8 @@ const describeTickStage = (stage: string): string => {
 
 /** 认得出来的整轮报错，顺带说一句该怎么办。认不出来的只给原文，不瞎猜。 */
 const describeTickFailureRemedy = (failure: AmsgTickFailureRecord): string => {
+  const limitText = describeD1LimitCode(failure.code);
+  if (limitText) return limitText;
   if (/no such (column|table)/i.test(failure.message)) {
     return '表结构跟现在的代码对不上，点上面的「重新连接并验证」补一次。';
   }
@@ -542,8 +549,9 @@ const describeTickFailure = (failure: AmsgTickFailureRecord, formatIso: (iso: st
   const head = failure.count > 1
     ? `Worker 每分钟那一跳${failure.ongoing ? '一直在' : '之前'}报错：${formatIso(failure.firstAt)} 到 ${formatIso(failure.lastAt)} 连着 ${failure.count} 次，卡在${stage}。`
     : `Worker 每分钟那一跳${failure.ongoing ? '刚刚' : '之前'}报了一次错（${formatIso(failure.lastAt)}），卡在${stage}。`;
+  const delivery = failure.stage === CLOUD_CLEANUP_STAGE ? '消息照常投递，不受它影响。' : '';
   return {
-    text: `${head}${describeTickFailureRemedy(failure)}`,
+    text: `${head}${delivery}${describeTickFailureRemedy(failure)}`,
     raw: `${failure.name}: ${failure.message}${failure.code ? ` (${failure.code})` : ''}`,
   };
 };
@@ -614,6 +622,9 @@ const buildTickRow = (debugReport: AmsgDebugReport, input: AmsgDiagnosticsInput)
   const tickFailureRecent = Boolean(
     tickFailure && !tickFailure.ongoing && tickFailureAtMs !== null && nowMs - tickFailureAtMs <= RECENT_FAILURE_MS,
   );
+  // 清理云端数据那一段出错不拦投递：照样列出来，但不按「消息发不出去」定级。
+  const cleanupFailing = Boolean(tickFailure?.ongoing && tickFailure.stage === CLOUD_CLEANUP_STAGE);
+  const tickBlocked = Boolean(tickFailure?.ongoing) && !cleanupFailing;
   const tickFailureWithinDay = Boolean(
     tickFailure && (tickFailure.ongoing || tickFailureAtMs === null || nowMs - tickFailureAtMs <= FAILURE_LOOKBACK_MS),
   );
@@ -628,9 +639,9 @@ const buildTickRow = (debugReport: AmsgDebugReport, input: AmsgDiagnosticsInput)
     return atMs !== null && nowMs - atMs <= RECENT_FAILURE_MS;
   }));
 
-  const level: AmsgDiagnosticLevel = tickFailure?.ongoing || (tick === 'stalled' && !cronPaused)
+  const level: AmsgDiagnosticLevel = tickBlocked || (tick === 'stalled' && !cronPaused)
     ? 'bad'
-    : pausedWithTasks || tick === 'stalled' || tick === 'failing' || tickFailureRecent || hourFailures.size > 0
+    : pausedWithTasks || tick === 'stalled' || tick === 'failing' || cleanupFailing || tickFailureRecent || hourFailures.size > 0
       ? 'warn'
       : tick === 'unknown'
         ? 'unknown'
@@ -641,7 +652,7 @@ const buildTickRow = (debugReport: AmsgDebugReport, input: AmsgDiagnosticsInput)
     ? (storageOverdue || listedTasks.length
       ? `后台任务暂停中，有 ${overdue} 条到点的任务等恢复后一起补发。`
       : `后台任务暂停中，${storage.pendingTasks ?? 0} 条待发任务到点了也先攒着，恢复后一起补发。`)
-    : tickFailure?.ongoing
+    : tickBlocked
       ? (overdue
         ? `Worker 每分钟那一跳在报错，有 ${overdue} 条任务到点还没发出去。报错原话和逐条情况在下面。`
         : 'Worker 每分钟那一跳在报错，原话在下面。')
@@ -653,15 +664,17 @@ const buildTickRow = (debugReport: AmsgDebugReport, input: AmsgDiagnosticsInput)
           ? (listedTasks.length
             ? summarizeFailingTasks(listedTasks, truncatedNote)
             : `有 ${storageOverdue} 条任务到点${lateText}还没发出去。Worker 在处理，但中间失败过，或者开始得比平时晚。`)
-          : tickFailureRecent
-            ? 'Worker 每分钟那一跳前一阵报过错，现在没再报。'
-            : hourFailures.size > 0
-              ? `最近一小时有 ${hourFailures.size} 次到点没发出去，原因在下面。`
-              : tick === 'healthy'
-                ? `${storage.pendingTasks ?? 0} 条待发任务，都在按时处理。`
-                : tick === 'idle'
-                  ? '现在没有待发任务。'
-                  : '手上没有待发任务，暂时看不出定时器在不在跑。';
+          : cleanupFailing
+            ? 'Worker 清理云端数据那一步在报错，消息照常投递。原话在下面。'
+            : tickFailureRecent
+              ? 'Worker 每分钟那一跳前一阵报过错，现在没再报。'
+              : hourFailures.size > 0
+                ? `最近一小时有 ${hourFailures.size} 次到点没发出去，原因在下面。`
+                : tick === 'healthy'
+                  ? `${storage.pendingTasks ?? 0} 条待发任务，都在按时处理。`
+                  : tick === 'idle'
+                    ? '现在没有待发任务。'
+                    : '手上没有待发任务，暂时看不出定时器在不在跑。';
 
   const items: AmsgDiagnosticItem[] = [];
   if (reportFailedReason && (level === 'bad' || level === 'warn')) {
@@ -669,7 +682,7 @@ const buildTickRow = (debugReport: AmsgDebugReport, input: AmsgDiagnosticsInput)
     items.push({ text: reportFailedReason });
   }
   if (tickReport) {
-    const ctx: TickTaskContext = { nowMs, formatIso, tickFailureOngoing: Boolean(tickFailure?.ongoing), cronPaused };
+    const ctx: TickTaskContext = { nowMs, formatIso, tickFailureOngoing: tickBlocked, cronPaused };
     items.push(...listedTasks.map((task) => describeTickTask(task, ctx)));
     if (tickFailure && (tickFailure.ongoing || tickFailureRecent || (level !== 'ok' && tickFailureWithinDay))) {
       items.push(describeTickFailure(tickFailure, formatIso));
@@ -788,12 +801,15 @@ export const buildAmsgDiagnosticRows = (input: AmsgDiagnosticsInput): AmsgDiagno
   }
 
   const vapidWarning = config.warnings.find((item) => item.code === 'VAPID_MISSING');
+  const isThirdPartyPush = input.pushMode === 'third-party';
   rows.push({
     key: 'pushCredential',
     label: '推送凭据',
-    level: vapidWarning ? 'bad' : 'ok',
+    level: vapidWarning && !isThirdPartyPush ? 'bad' : 'ok',
     // 这是最难自己查出来的一种坏法：任务建得成、界面全绿，到点一条都推不出去。
-    detail: vapidWarning ? vapidWarning.message : 'VAPID 已配齐。',
+    detail: isThirdPartyPush
+      ? (vapidWarning ? '当前使用第三方推送 App，无需配置 VAPID 密钥。' : '使用第三方推送 App（VAPID 也已配置）。')
+      : (vapidWarning ? vapidWarning.message : 'VAPID 已配齐。'),
   });
 
   const remoteRegistered = storage.pushSubscriptionRegistered === true;
@@ -807,12 +823,19 @@ export const buildAmsgDiagnosticRows = (input: AmsgDiagnosticsInput): AmsgDiagno
     key: 'pushDevice',
     label: '这台设备',
     level: !localPushSubscribed ? 'bad' : !remoteRegistered ? 'bad' : deliveryVerdict?.level || 'ok',
-    detail: !localPushSubscribed
-      ? '这台设备还没订阅推送，点下面的「开启通知与推送」。'
-      : !remoteRegistered
-        ? '浏览器订阅好了，但 Worker 上没有登记收件设备——到点的消息发不出去。点下面的「开启通知与推送」补登记一次。'
-        : deliveryVerdict?.detail
-          || '浏览器已订阅，Worker 上也登记了收件设备，最近一次推送也没被退回来。换设备或换浏览器之后要在新的那台上再点一次「开启通知与推送」。',
+    detail: isThirdPartyPush
+      ? !localPushSubscribed
+        ? '还没填写有效的第三方推送 Token，请在上方填写并点击「保存并登记推送」。'
+        : !remoteRegistered
+          ? '第三方推送 Token 已填写，但还没登记到 Worker——请点击「保存并登记推送」。'
+          : deliveryVerdict?.detail
+            || '第三方推送通道已登记到 Worker。可点击「发送测试通知」确认手机能否收到横幅。'
+      : !localPushSubscribed
+        ? '这台设备还没订阅推送，点下面的「开启通知与推送」。'
+        : !remoteRegistered
+          ? '浏览器订阅好了，但 Worker 上没有登记收件设备——到点的消息发不出去。点下面的「开启通知与推送」补登记一次。'
+          : deliveryVerdict?.detail
+            || '浏览器已订阅，Worker 上也登记了收件设备，最近一次推送也没被退回来。换设备或换浏览器之后要在新的那台上再点一次「开启通知与推送」。',
   });
 
   rows.push(buildTickRow(probe.report, input));

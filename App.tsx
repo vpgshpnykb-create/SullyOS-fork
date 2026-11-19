@@ -1,3 +1,4 @@
+import UserSpaceNotice from './components/user/UserSpaceNotice';
 
 import React from 'react';
 import { OSProvider } from './context/OSContext';
@@ -9,6 +10,10 @@ import Amsg2DebugPanel from './components/Amsg2DebugPanel';
 import VRBroadcast from './components/VRBroadcast';
 import WorldBroadcast from './components/WorldBroadcast';
 import ChatBroadcast from './components/ChatBroadcast';
+import InstantChatSendHelp from './components/chat/InstantChatSendHelp';
+import WebUpdateNotice from './components/WebUpdateNotice';
+import AmsgOwnerConflictNotice from './components/AmsgOwnerConflictNotice';
+import AmsgRescueAlert from './components/AmsgRescueAlert';
 import { isIOSStandaloneWebApp } from './utils/iosStandalone';
 import { installDevDebugLifecycleCapture } from './utils/devDebug';
 
@@ -43,6 +48,9 @@ const App: React.FC = () => {
             {/* 挂在 Provider 里面才能直接读 characters（省掉轮询 IndexedDB），
                 面板自身用 portal 渲染到 body，绕开上面那层 transform 对 fixed 定位的影响。 */}
             <Amsg2DebugPanel />
+            <WebUpdateNotice />
+            <AmsgOwnerConflictNotice />
+            <UserSpaceNotice />
           </OSProvider>
         </div>
       </div>
@@ -51,6 +59,9 @@ const App: React.FC = () => {
       <VRBroadcast />
       <WorldBroadcast />
       <ChatBroadcast />
+      <InstantChatSendHelp />
+      {/* 救援模式安全警告：全局只挂这一处，自己进浏览器顶层盖住一切。 */}
+      <AmsgRescueAlert />
     </>
   );
 };

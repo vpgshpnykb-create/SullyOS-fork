@@ -1,3 +1,7 @@
+import { diagnosticRunId } from './amsgReproduction';
+import { subscribePageForeground } from './pageForeground';
+import { listUserSpaces } from './userSpaces';
+import { recordDiagnosticInbox } from './amsgReproductionStore';
 import { createReplyRun, isReplyStopped, withReplyCancellation, type ReplyRun } from './chatReplyCancellation';
 import { loadCharacterContextMessages } from './chatContextRange';
 import { ActiveMsg2InboxMessage, ActiveMsg2TaskRecord, APIConfig, RealtimeConfig, UserProfile } from '../types';
@@ -5,7 +9,8 @@ import { DB } from './db';
 import { ChatPrompts } from './chatPrompts';
 import { ActiveMsgStore } from './activeMsgStore';
 import { ActiveMsgClient, type AmsgOutboxEntry, type RemoteTaskStatus } from './activeMsgClient';
-import { AMSG_CHAT_FAIL_KEY, AMSG_SELF_LOG_KEY, amsgStateNamespace, parseChatFailRecord, parseSelfLog } from './amsgFirePack';
+import { isAmsg2GloballyEnabled, isAmsg2WorkerActive, isAmsgGlobalDisabledError } from './amsgGlobalGate';
+import { AMSG_CHAT_FAIL_KEY, amsgStateNamespace, parseChatFailRecord } from './amsgFirePack';
 import {
   applyAssistantPostProcessing,
   type PostProcessDirective,
@@ -18,7 +23,6 @@ import { processNewMessagesWithAutoArchive } from './memoryPalace/autoArchive';
 import { loadMusicHooks } from '../context/MusicContext';
 import type { XhsNote } from './realtimeContext';
 import { appendDevDebugLog, makeDebugLogger } from './devDebug';
-import { getLastRealUserMessageAt, shouldExpireFire } from './amsg2ExpireGuard';
 import {
   AMSG_INSTANT_CHAT_PENDING_EVENT,
   INSTANT_CHAT_STATUS_CHECK_INTERVAL_MS,
@@ -29,9 +33,13 @@ import {
   listInstantChatPendings,
   settleInstantChatApiLog,
   settleInstantChatExpiredNotices,
+  settleLateCloudEmotionEvalLog,
 } from './amsgInstantChat';
+import { recordCompletedCloudApiCall } from './apiCallLog';
+import { resolveDialogueApi } from './characterApi';
 import { dispatchAmsgResult } from './amsgResults';
 import { requestStartupUpdateCheck } from './amsgAutoUpdateTrigger';
+import { probeRescueOnForeground, probeRescueOnStartup } from './amsgRescueProbe';
 import { flushAmsgState } from './amsgStateSync';
 import { describeInstantChatFailure, pruneStaleTasks, type RemoteTaskLastError } from './amsg2Tasks';
 // 线协议常量的唯一出处是 shared（amsg-sw 只是 re-export 同一份）。
@@ -96,39 +104,6 @@ export const pushXhsCaches: XhsCaches = {
 };
 export const pushLastXhsNotesRef: { current: XhsNote[] } = { current: [] };
 
-// 防穿帮闸·送达判定缓存：一次 fire 的多分段 push 必须同吞同放（不能吞一半），
-// 按「任务 + occurrence」记住首段判定。Web Push/FCM 不保证分段按序到达，逻辑
-// 上的最后一段可能最先到，所以不能在 messageIndex===totalMessages 时立即删除；
-// 保留 5 分钟 TTL，让迟到分段仍复用同一决定。
-// （导出仅为让 activeMsgRuntime.test.ts 用真实 TTL 校验重判边界，运行时不消费。）
-export const EXPIRE_DECISION_TTL_MS = 5 * 60_000;
-type ExpireDecisionEntry = { expired: boolean; expiresAt: number };
-const expireDecisionByFire = new Map<string, ExpireDecisionEntry>();
-
-/**
- * 送达判定的 get-or-compute（带 TTL 过期清扫）。从吞没闸里抽出来单测：
- *   - 同一 fireKey 的多次调用只 evaluate 一次——一次 fire 的多分段 push 同吞同放；
- *   - TTL 过后同 key 才允许重新 evaluate（迟到分段仍复用同一决定）。
- * cache 由调用方注入：运行时传模块级 expireDecisionByFire，测试传临时 Map 做隔离。
- * 行为与内联版逐字节对齐（先扫过期、再 get、缺失才 compute-and-set）。
- */
-export async function resolveFireExpireDecision(
-  cache: Map<string, ExpireDecisionEntry>,
-  fireKey: string,
-  now: number,
-  evaluate: () => Promise<boolean>,
-): Promise<boolean> {
-  for (const [key, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(key);
-  }
-  let cached = cache.get(fireKey);
-  if (!cached) {
-    cached = { expired: await evaluate(), expiresAt: now + EXPIRE_DECISION_TTL_MS };
-    cache.set(fireKey, cached);
-  }
-  return cached.expired;
-}
-
 type MemoryPalaceGlobalConfig = {
   embedding: { baseUrl: string; apiKey: string; model: string; dimensions: number };
   lightLLM: { baseUrl: string; apiKey: string; model: string };
@@ -165,7 +140,7 @@ const loadApiConfigFromLocalStorage = (): APIConfig => {
 
 /** 从 localStorage 读 RealtimeConfig — 整个 push 路径里我们不会再回连 LLM, 但 ChatParser
  *  及 DIARY 写入(可执行的副作用)需要这些配置, 缺失时返回 undefined 让消费方走 fallback。 */
-const loadRealtimeConfigFromLocalStorage = (): RealtimeConfig | undefined => {
+export const loadRealtimeConfigFromLocalStorage = (): RealtimeConfig | undefined => {
   const raw = (() => {
     try {
       return localStorage.getItem('os_realtime_config');
@@ -206,15 +181,26 @@ const loadRealtimeConfigFromLocalStorage = (): RealtimeConfig | undefined => {
  */
 type OffloadedCleanup = { namespace: string; ref: string; what: string };
 
+const isGloballyEnabledNow = async (): Promise<boolean> => {
+  if (typeof ActiveMsgStore.getGlobalConfig !== 'function') return true;
+  try {
+    return isAmsg2GloballyEnabled(await ActiveMsgStore.getGlobalConfig());
+  } catch {
+    return true;
+  }
+};
+
 /**
  * 这条消息处理成功之后，把它取用过的那几份云端旁路副本删掉。
  * 尽力而为：删不掉只 warn（下次触发会覆盖，不影响正确性）。
  */
 const runOffloadedCleanups = async (cleanups: OffloadedCleanup[]): Promise<void> => {
+  if (cleanups.length === 0 || !(await isGloballyEnabledNow())) return;
   for (const { namespace, ref, what } of cleanups) {
     try {
       await ActiveMsgClient.clearClientStateValue(namespace, ref);
     } catch (error) {
+      if (isAmsgGlobalDisabledError(error)) return;
       log.warn(`清空旁路存储的${what}失败（下次触发会覆盖，不影响正确性）`, { ref, error });
     }
   }
@@ -231,11 +217,30 @@ const fetchOffloadedXhsSession = async (
   message: ActiveMsg2InboxMessage,
   cleanups: OffloadedCleanup[],
 ): Promise<any | null> => {
+  const attachment = (message.metadata as any)?.xhsSessionAttachment;
+  if (attachment && typeof attachment === 'object') {
+    if (!(await isGloballyEnabledNow())) return null;
+    try {
+      const raw = await ActiveMsgClient.readAttachment(attachment);
+      if (raw == null) throw new Error('XHS attachment is unavailable or expired');
+      return JSON.parse(raw);
+    } catch (error) {
+      if (isAmsgGlobalDisabledError(error)) return null;
+      throw error;
+    }
+  }
   const ref = (message.metadata as any)?.xhsSessionRef;
   if (typeof ref !== 'string' || !ref) return null;
+  if (!(await isGloballyEnabledNow())) return null;
 
   const namespace = amsgStateNamespace(message.charId);
-  const raw = await ActiveMsgClient.readClientStateValue(namespace, ref);
+  let raw: string | null = null;
+  try {
+    raw = await ActiveMsgClient.readClientStateValue(namespace, ref);
+  } catch (error) {
+    if (isAmsgGlobalDisabledError(error)) return null;
+    throw error;
+  }
   if (raw == null) {
     // 键不在了：同任务的下一次触发已经把它覆盖/清掉了，这条 push 是迟到的老消息。
     // 重试也取不回来，按「没有卡片数据」继续——比卡在收件箱里反复重试强。
@@ -269,8 +274,19 @@ const fetchOffloadedExtra = async (
   /** 取回成功时把「这份云端副本可以删了」登记进来，由调用方在处理成功后统一删。 */
   cleanups: OffloadedCleanup[],
 ): Promise<string | null> => {
+  const attachment = (message.metadata as any)?.[refField.replace(/Ref$/, 'Attachment')];
+  if (attachment && typeof attachment === 'object') {
+    if (!(await isGloballyEnabledNow())) return null;
+    try { return await ActiveMsgClient.readAttachment(attachment); }
+    catch (error) {
+      if (isAmsgGlobalDisabledError(error)) return null;
+      log.warn(`取附件中的${labels.what}失败（${labels.whenMissing}）`, { error });
+      return null;
+    }
+  }
   const ref = (message.metadata as any)?.[refField];
   if (typeof ref !== 'string' || !ref) return null;
+  if (!(await isGloballyEnabledNow())) return null;
 
   const namespace = amsgStateNamespace(message.charId);
   try {
@@ -283,6 +299,7 @@ const fetchOffloadedExtra = async (
     cleanups.push({ namespace, ref, what: labels.what });
     return raw;
   } catch (error) {
+    if (isAmsgGlobalDisabledError(error)) return null;
     log.warn(`取旁路存储的${labels.what}失败（${labels.whenMissing}）`, { ref, error });
     return null;
   }
@@ -335,7 +352,7 @@ const LATE_EMOTION_POLL_INTERVAL_MS = 20_000;
 const LATE_EMOTION_POLL_MAX_TRIES = 8;
 // value 是各轮询独有的会话对象：tick 的 await 期间被 cancel / 被新一轮顶替时，
 // 比对引用就能发现自己已经不是当前那一轮，静默退场。
-const lateEmotionPolls = new Map<string, { timer: ReturnType<typeof setTimeout> }>();
+const lateEmotionPolls = new Map<string, { timer: ReturnType<typeof setTimeout>; taskUuid?: string | null }>();
 
 export const cancelLateEmotionPoll = (charId: string): void => {
   const entry = lateEmotionPolls.get(charId);
@@ -356,14 +373,30 @@ export const startLateEmotionPoll = (
   const maxTries = opts?.maxTries ?? LATE_EMOTION_POLL_MAX_TRIES;
   cancelLateEmotionPoll(charId);
   const namespace = amsgStateNamespace(charId);
-  const entry = { timer: undefined as unknown as ReturnType<typeof setTimeout> };
+  const entry = { timer: undefined as unknown as ReturnType<typeof setTimeout>, taskUuid: opts?.taskUuid };
   let tries = 0;
   const tick = async (): Promise<void> => {
+    if (!(await isGloballyEnabledNow())) {
+      if (lateEmotionPolls.get(charId) === entry) {
+        lateEmotionPolls.delete(charId);
+        settleLateCloudEmotionEvalLog(opts?.taskUuid, false);
+        announceEmotionDone(charId);
+      }
+      return;
+    }
     tries += 1;
     let raw: string | null = null;
     try {
       raw = await ActiveMsgClient.readClientStateValue(namespace, ref);
     } catch (error) {
+      if (isAmsgGlobalDisabledError(error)) {
+        if (lateEmotionPolls.get(charId) === entry) {
+          lateEmotionPolls.delete(charId);
+          settleLateCloudEmotionEvalLog(opts?.taskUuid, false);
+          announceEmotionDone(charId);
+        }
+        return;
+      }
       // 读失败当「还没到」：网络抖一下不该终结这轮补落。
       logAmsg.warn('晚投情绪补落这一跳没读到（下一跳再试）', { charId, ref, error });
     }
@@ -373,6 +406,7 @@ export const startLateEmotionPoll = (
     if (raw) {
       lateEmotionPolls.delete(charId);
       await landCloudEmotionResult(charId, raw);
+      settleLateCloudEmotionEvalLog(opts?.taskUuid, true);
       announceEmotionDone(charId);
       activeMsgTrace('runtime-late-emotion-landed', { charId, tries });
       // 用完即删（同旁路取回的口径）；删不掉下次触发会覆盖，只 warn。
@@ -385,6 +419,7 @@ export const startLateEmotionPoll = (
     }
     if (tries >= maxTries) {
       lateEmotionPolls.delete(charId);
+      settleLateCloudEmotionEvalLog(opts?.taskUuid, false);
       announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {
         charId, charName,
         reason: '云端情绪评估最终没等到（副 API 太慢或报错），这一轮不更新',
@@ -555,6 +590,7 @@ const processInboxMessageWithPostProcessing = async (
   // 在线送达 = undefined (落库走 DB.saveMessage 默认的写库当刻)。
   persistTimestamp?: number,
   replyRun?: ReplyRun,
+  skipTypingSignal?: AbortSignal,
 ): Promise<void> => {
   const replyStep = <T>(operation: () => Promise<T>) => withReplyCancellation(replyRun, operation);
   // 这一趟从云端旁路存储取回来的东西，等整条消息处理成功了再去删（见 OffloadedCleanup）。
@@ -611,8 +647,7 @@ const processInboxMessageWithPostProcessing = async (
   // 思考链挂在第一条 content push 的 metadata.amsgReasoning 上（太长时挪进 client_state、
   // 只留 amsgReasoningRef，见 worker/amsg/src/index.ts 的 offloadOversizedPush），
   // 只在第一条上取，渲染成第一条 assistant message 的 metadata.thinkingChain。
-  // 定时任务那条路 worker 刻意不带思考（prompt 里没有「心象」提示词，原始推理腔当卡片
-  // 是穿帮），所以这里也不会有值——收侧不用另设门。
+  // 定时任务由 worker 按 thinkingChainEnabled 决定是否携带；收侧复用同一套落库。
   let reasoningContent: string | undefined;
   if (messageIndex <= 1) {
     const inlineReasoning = (message.metadata as any)?.amsgReasoning;
@@ -779,10 +814,15 @@ const processInboxMessageWithPostProcessing = async (
     //   3. 送达时人不在场：系统通知已经把整句话完整显示过，他是看着通知点进来的。
     // App 在前台时收到的实时消息照旧慢放——那才是「角色正在你眼前打字」的场景。
     instantRender: shouldRenderInstantly(message.metadata, message.receivedAt, Date.now()),
+    skipTypingSignal,
     // 交给后处理逐气泡对齐写进 metadata.sarModuleSurface——和本地路径同一处消费。
     sarModuleSurface,
   }));
 
+  if(isLastChunk(message) && message.taskUuid) {
+    const {settleFriendFeedCloudTask}=await import('./friendFeedEmotion');
+    await settleFriendFeedCloudTask(char.id,message.taskUuid,true);
+  }
   // ─── 即时对话（amsg2）的情绪评估结果 ───
   // 云端跟主回复并行跑完的那份，挂在最后一条 push 的 metadata 上（装不下时挪进
   // client_state、只留 amsgEmotionRef，见 worker 的 offloadOversizedPush）。
@@ -817,6 +857,7 @@ const processInboxMessageWithPostProcessing = async (
       startLateEmotionPoll(message.charId, pendingRef, message.charName || '', { taskUuid: message.taskUuid });
     } else {
       // 标了 pending 却没给引用键（worker bug）：没法轮询，按「有结论但没结果」收尾。
+      settleLateCloudEmotionEvalLog(message.taskUuid, false);
       announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {
         charId: message.charId, charName: message.charName || '',
         reason: '云端情绪评估晚投但缺少引用键（worker 可能有 bug），这一轮不更新',
@@ -868,125 +909,6 @@ function isLastChunk(message: ActiveMsg2InboxMessage): boolean {
 }
 
 /**
- * 送达时的作废判定（防穿帮闸·客户端兜底层）。worker onBeforeFire 已做同一
- * 判定，但它读的 fire_pack 随 amsgStateSync 最多滞后 15s+，且判定通过后还有
- * 10-30s 生成窗口，期间用户又说话就会撞车——这里用本地全量历史再判一次。
- * 判定所需字段全部来自 push 自己带的，不依赖本地 config——push 在途期间任务被 renew
- * 换锚也不会误判。其中 recurrenceType / occurrenceMs 读 push 顶层那份（库盖的，两条
- * 排程路径同源）；策略与锚点是应用自己的语义，仍在任务 metadata 里。
- *
- * **读不到聊天记录时抛错，不猜。** 拿不准就先别开口：调用方会把消息压回收件箱、
- * 过一会儿等本地存储缓过来再判一次（见 flushInboxToChatImpl 的 expire-unknown 分支）。
- * 猜「放行」的代价是角色可能当着正在聊天的用户冒出一句定时问候，一眼假。
- */
-/**
- * 一次 fire 的归属键：吞放缓存按它记（多分段同吞同放），trace 也按它归组。
- *
- * 必须含 occurrence——sessionId 对循环任务的每次触发、对同一次的每次重试都可能重复，
- * 裸用会把上次的判定串给下一次。两处调用抄两份的话，改一处就会静默失联（缓存按新键
- * 存、trace 按旧键归组），所以公式只在这里写一次。
- */
-const buildFireKey = (message: ActiveMsg2InboxMessage): string =>
-  `${(message.metadata as any)?.amsgClientTaskId}:${message.occurrenceMs ?? ''}`;
-
-async function evaluateScheduledPushExpired(message: ActiveMsg2InboxMessage): Promise<boolean> {
-  const meta = (message.metadata || {}) as Record<string, any>;
-  const messages = await DB.getRecentMessagesByCharId(message.charId, 200);
-  const input = {
-    policy: meta.amsgExpirePolicy,
-    lastUserMessageAt: getLastRealUserMessageAt(messages),
-    nowMs: Date.now(),
-    // 窗口锚定到点时刻而不是送达时刻：生成+送达可能比到点晚十几分钟，拿 Date.now()
-    // 算 10 分钟窗会把撞上对话的消息误放行。
-    occurrenceMs: message.occurrenceMs ?? undefined,
-  };
-  const expired = shouldExpireFire(input);
-  // 判定输入原样留一行，**放行也留**。吞掉是这条链路上唯一「用户什么都看不到」的出口
-  // （不进聊天流、不弹提示、还会去云端账本销账），事后只剩这一行说得出发生过什么；
-  // 而放行同样要留——三种去向（吞了 / 放行了 / 闸没跑，见调用方的
-  // runtime-expire-gate-skipped）各留各的痕，才不用靠别的 trace 反推是哪一种。
-  // 判定每次 fire 只跑一趟（多分段共用缓存），不会刷屏。
-  // 与 worker 的 [amsg:expire-skip] / [amsg:expire-pass] 字段同源：两边结论分叉时
-  // （worker 放行、客户端吞掉）对照着看就知道是哪个字段不一样。
-  activeMsgTrace(expired ? 'runtime-expire-decision-swallow' : 'runtime-expire-decision-pass', {
-    sessionId: buildFireKey(message),
-    messageId: message.messageId,
-    charId: message.charId,
-    taskId: message.taskId,
-    // 判定本身已经不看任务类型了（一次性和循环同一条规则），但排查时得认得出这是哪种任务。
-    recurrenceType: message.recurrenceType ?? undefined,
-    ...input,
-  });
-  return expired;
-}
-
-/**
- * 云端自述日志里这条 push 对应的条目 id。
- *
- * 格式跟 worker 写日志时用的那一份对齐（`<clientTaskId>@<触发时刻>`，见 amsgFirePack
- * 的 AmsgSelfLogEntry.id 与 worker/amsg/src/index.ts 的 amsgFireSettled）——两边拼法
- * 必须一模一样，差一个字符就对不上号。缺任务归属键时 worker 用的是字面量 'task'。
- * 触发时刻缺失（老 push 不带）返回 null：没有 id 就没法精确认领，宁可不动。
- */
-export const buildSelfLogEntryId = (message: ActiveMsg2InboxMessage): string | null => {
-  const occurrenceMs = message.occurrenceMs;
-  if (typeof occurrenceMs !== 'number' || !Number.isFinite(occurrenceMs)) return null;
-  const clientTaskId = (message.metadata as any)?.amsgClientTaskId;
-  const owner = typeof clientTaskId === 'string' && clientTaskId ? clientTaskId : 'task';
-  return `${owner}@${occurrenceMs}`;
-};
-
-/**
- * 被兜底闸吞掉的这条，顺手把云端「我说过什么」里对应的那条也撤掉。
- *
- * 不撤的话：worker 发完就把正文记进了 client_state 的 self_log，而这条消息在客户端被吞、
- * 用户一个字都没看到；下一次到点的 prompt 里【这之后你又主动发过】赫然列着它，角色接着
- * 往下说一句没人看过的话。
- *
- * 只摘被吞的那一条，其余原样留着：日志里别的条目是用户真收到过的话，跟着一起抹掉的话
- * 角色反而会把说过的再说一遍；角色自排的任务清单同理，缺一块下次就会把同一件事再排一遍。
- * 摘完整份空了（没有条目也没有任务）就直接写空串——空日志和没有日志对 worker 是同一件事
- * （parseSelfLog 拿不到 → 重新建一份空的），比留一份空壳 JSON 省事。
- *
- * 值是裸 JSON，跟 worker 写这份时的口径一致（amsgFireSettled 里也是 JSON.stringify 直传，
- * 不走 fire_pack 那套压缩）。
- *
- * best-effort：读写失败只留 warn，不影响「吞」这个动作本身（与 worker 侧 writeLastSkip 同语义）。
- */
-export const revokeSwallowedSelfLogEntry = async (
-  charId: string,
-  entryId: string,
-): Promise<'no-log' | 'not-found' | 'cleared' | 'rewritten'> => {
-  const namespace = amsgStateNamespace(charId);
-  const raw = await ActiveMsgClient.readClientStateValue(namespace, AMSG_SELF_LOG_KEY);
-  const selfLog = parseSelfLog(raw ?? '');
-  if (!selfLog) return 'no-log';
-  const revoked = selfLog.entries.find((e) => e.id === entryId);
-  if (!revoked) return 'not-found';
-
-  const rest = selfLog.entries.filter((e) => e.id !== entryId);
-  if (rest.length === 0 && selfLog.tasks.length === 0) {
-    await ActiveMsgClient.clearClientStateValue(namespace, AMSG_SELF_LOG_KEY);
-    return 'cleared';
-  }
-  // 连发计数也要跟着退回去，规则跟 appendSelfLogEntry 的加法一一对应（reply 当初就没加，
-  // 这里也不减）。不减的话，用户清空聊天记录那条吞消息的分支会留下一笔糊涂账：那时
-  // lastUserMessageAt 是 null，下一次 fire 的 reconcileSelfLogWithPack 归零条件够不到，
-  // 这些用户根本没看见的消息会一直占着连发额度，直到额度满、正常的主动消息被拦下，
-  // 面板还说「你未回复期间 ta 连发已到上限」。
-  await ActiveMsgClient.writeClientStateValue(
-    namespace,
-    AMSG_SELF_LOG_KEY,
-    JSON.stringify({
-      ...selfLog,
-      entries: rest,
-      unansweredSends: Math.max(0, selfLog.unansweredSends - (revoked.reply ? 0 : 1)),
-    }),
-  );
-  return 'rewritten';
-};
-
-/**
  * 认领到新任务之后广播的事件名。detail 只带 charId，监听方（OSContext）自己重读角色、
  * 把新任务合并进内存清单并打脏。事件名和 detail 形状是两侧的约定，改这里要同步改那边。
  */
@@ -1019,7 +941,7 @@ async function adoptSelfScheduledTasks(message: ActiveMsg2InboxMessage): Promise
     await DB.saveCharacter({
       ...char,
       activeMsg2Config: {
-        ...(char.activeMsg2Config ?? { enabled: true }),
+        ...(char.activeMsg2Config ?? { enabled: false }),
         tasks: pruneStaleTasks([...existing, ...added], Date.now()),
       },
     });
@@ -1076,7 +998,7 @@ async function applyRemoteTaskMutations(message: ActiveMsg2InboxMessage): Promis
 
     await DB.saveCharacter({
       ...char,
-      activeMsg2Config: { ...(char.activeMsg2Config ?? { enabled: true }), tasks: next },
+      activeMsg2Config: { ...(char.activeMsg2Config ?? { enabled: false }), tasks: next },
     });
     console.log('[ActiveMsg] 消账角色取消/改期的任务', { cancelled, renewed });
     // 与认领共用同一个事件：监听方（OSContext）做的是「重读角色」，增删改对它是一回事。
@@ -1370,8 +1292,8 @@ const scheduleInboxRetry = (attempts: number) => {
 /**
  * 这一趟冲刷里被写回收件箱、还要再处理一次的消息。
  *
- * 云端账本的销账口径是「这条消息在客户端有着落了」——落库、按重复丢弃、被防穿帮闸
- * 吞掉都算有着落，唯独写回收件箱不算：账一销，下次就再也拉不回来了，而它还没处理完。
+ * 云端账本的销账口径是「这条消息在客户端有着落了」——落库、按重复丢弃、用户明确停止
+ * 都算有着落，唯独写回收件箱不算：账一销，下次就再也拉不回来了，而它还没处理完。
  * 所以这里反过来记「没着落的」，冲刷收尾时从本批里刨掉它们再销账。
  *
  * 用模块级集合而不是层层传参：冲刷本身是串行链（flushChain），同一时刻只有一趟在跑，
@@ -1518,7 +1440,7 @@ const holdUntilEarlierChunksLand = async (
  * 送达失败发生在哪一段。**每条上报都要带**：不带的话面板上会多出一个空分组，
  * 而空分组恰恰是最需要被看见的那种「不知道哪来的」。
  */
-type InboxFailureStage = '收发' | '防穿帮闸' | '后处理' | '补收';
+type InboxFailureStage = '收发' | '后处理' | '补收';
 
 /**
  * 告诉用户「有条消息没能正常显示」。
@@ -1563,10 +1485,12 @@ const notifyInboxProcessFailed = (
  * 一直推给一个不存在的角色。取消不掉也不要紧（网络问题），下一条推过来时还会再试一次。
  */
 const cancelOrphanedRemoteTasks = async (charId: string): Promise<void> => {
+  if (!(await isGloballyEnabledNow())) return;
   try {
     const { targets, failed } = await ActiveMsgClient.cancelAllTasksForChar(charId, []);
     log.warn('清理远端孤儿任务', { charId, targets: targets.length, failed: failed.size });
   } catch (e) {
+    if (isAmsgGlobalDisabledError(e)) return;
     log.warn('清理远端孤儿任务失败（下次收到同角色 push 时会再试）', { charId, error: e });
   }
 };
@@ -1575,7 +1499,7 @@ const cancelOrphanedRemoteTasks = async (charId: string): Promise<void> => {
  * 收件箱这条消息在处理途中抛了错，按跟后处理失败同一套去向收尾。
  *
  * 后处理管线自己那圈 try/catch 只盖住 applyAssistantPostProcessing 那一小截；查近史去重、
- * 认领角色自排任务、防穿帮闸、等齐守卫、算落库时间戳这些步骤同样会读本地存储，同样会因
+ * 认领角色自排任务、等齐守卫、算落库时间戳这些步骤同样会读本地存储，同样会因
  * IndexedDB 被占 / 配额满而抛错。收件箱已经在 consumeInboxMessages 那一刻被原子取空，
  * 让异常冒出去就等于整批消息凭空蒸发（既不在聊天记录、也不在收件箱、也没有任何提示）。
  *
@@ -1628,15 +1552,50 @@ export type FlushTrigger =
   | '启动'            // App 冷启动时的兜底排空
   | '重试'            // 上一趟处理失败，定时重来
   | '等齐重看'        // 多段消息扣住后段，隔几秒回头看前段到了没
+  | '动作结果'        // 后台动作结果入箱后立即落库，成功才确认云端结果
   | '上线补收'        // 开 App 自动去云端账本捞后台期间漏掉的
   | '手动补收'        // 用户点「找回没收到的消息」
   | '轮询补收'        // 即时对话 60 秒点名顺手把账本上的捞回来
   | '原生收件箱'      // 原生壳把消息塞进收件箱后触发
   | '原生推送'       // 原生壳收到推送后触发
-  | '本地巡查';       // 前台每几秒数一眼本地收件箱，自己发现躺着的消息
+  | '本地巡查'        // 前台每几秒数一眼本地收件箱，自己发现躺着的消息
+  | '第三方补收'      // 第三方推送叫不醒页面，前台时定期去云端账本拉
+  | '生成前收件';     // 只处理本轮角色的本地收件箱，不拉云端账本
 
-const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> => {
-  const pendingMessages = await ActiveMsgStore.consumeInboxMessages();
+// ─── 生成前收件与冲刷之间的共享状态（见 prepareInboxBeforeChat）───
+/**
+ * 此刻有几次生成正停在生成前收件上等。有人在等时整条串行链都跳过打字动画，不分是谁的
+ * 消息（挡在前面的别的角色的气泡也得先放完）；等的人走了（收完或超时）就恢复打字节奏。
+ */
+let inboxPreparationWaiters = 0;
+/** 当前正在处理的那条消息的打字等待；冲刷是串行的，同一时刻至多一条。 */
+let activeInboxTyping: AbortController | null = null;
+/** 有冲刷正在认领收件箱、认领结果还没出来。 */
+let inboxClaimsInProgress = 0;
+/** 已被认领、还没处理完的消息各属于哪些角色（角色 → 在跑的冲刷趟数）。 */
+const inFlightInboxCharacters = new Map<string, number>();
+
+/** 这条消息正等着重试定时器或等齐定时器来处理。 */
+const isAwaitingInboxTimer = (message: ActiveMsg2InboxMessage): boolean =>
+  (message.processAttempts ?? 0) > 0 || inboxOrderHolds.has(message.messageId);
+
+const flushInboxToChatImpl = async (trigger: FlushTrigger, charId?: string): Promise<string[]> => {
+  inboxClaimsInProgress += 1;
+  let pendingMessages: ActiveMsg2InboxMessage[];
+  try {
+    // 生成前收件不碰正在等重试 / 等前段的消息：它们按自己的定时器再处理，
+    // 每次点发送都重跑一遍会把重试次数和等齐次数提前耗光。
+    const localIds = listUserSpaces().length > 1 ? new Set((await DB.getAllCharacters()).map(c => c.id)) : null;
+    pendingMessages = await ActiveMsgStore.consumeInboxMessages(
+      charId, message => !!localIds && !localIds.has(message.charId) && !diagnosticRunId(message.metadata) || (trigger === '生成前收件' && isAwaitingInboxTimer(message)),
+    );
+  } finally {
+    inboxClaimsInProgress -= 1;
+  }
+  // 按角色认领却一条没有：什么都没发生，不留 trace（理由同 sweepLocalInbox 的空表）。
+  if (charId !== undefined && pendingMessages.length === 0) return [];
+  const batchCharIds = new Set(pendingMessages.map((m) => m.charId));
+  for (const id of batchCharIds) inFlightInboxCharacters.set(id, (inFlightInboxCharacters.get(id) ?? 0) + 1);
   // 这一趟真正落进聊天流的那几条（见 flushInboxToChat 的返回值说明）。
   const landedMessageIds: string[] = [];
   activeMsgTrace('runtime-flush-start', { count: pendingMessages.length, trigger });
@@ -1673,9 +1632,41 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
   // 降级回原来的 "原文一次性 saveMessage" 防止消息丢失。dispatchEvent 始终 fire 一次,
   // 保证 toast / 未读 / 通知语义不变。
   for (const message of pendingMessages) {
+    // 包括重启后的补收与重复推送：任何诊断消息都不能进入角色业务。
+    const diagId = diagnosticRunId(message.metadata);
+    if (diagId) {
+      try {
+        await recordDiagnosticInbox(message, trigger);
+        const diagUsage = (message.metadata as any)?.amsgUsage;
+        if (diagUsage && typeof diagUsage === 'object') {
+          const apiCfg = loadApiConfigFromLocalStorage();
+          const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+          recordCompletedCloudApiCall({
+            id: `cloud-diag-${diagId}`,
+            route: 'cloud-diagnostic',
+            baseUrl: apiCfg.baseUrl,
+            model: apiCfg.model,
+            ok: true,
+            timestamp: message.sentAt || message.receivedAt || Date.now(),
+            promptTokens: num(diagUsage.promptTokens),
+            completionTokens: num(diagUsage.completionTokens),
+            meta: { appId: 'settings', appName: '设置', purpose: '主动消息诊断测试' },
+          });
+        }
+      }
+      catch {
+        retainedInboxMessageIds.add(message.messageId);
+        try { await ActiveMsgStore.saveInboxMessage(message); } catch { /* 云端账不销，下次补收 */ }
+      }
+      continue;
+    }
     if (isReplyStopped(message.taskUuid)) {
-      if (message.taskUuid && (message.metadata as any)?.amsgUsage) {
-        settleInstantChatApiLog(message.taskUuid, message.metadata);
+      if (message.taskUuid && ((message.metadata as any)?.amsgUsage || (message.metadata as any)?.amsgModelCalls)) {
+        try { await settleInstantChatApiLog(message.taskUuid, message.metadata); }
+        catch {
+          retainedInboxMessageIds.add(message.messageId);
+          try { await ActiveMsgStore.saveInboxMessage(message); } catch { /* 下次补收重试记账 */ }
+        }
       }
       continue;
     }
@@ -1685,11 +1676,19 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
     const replyRun = isInstantReply && message.taskUuid
       ? createReplyRun(message.charId, message.taskUuid) : undefined;
     const replyStep = <T>(operation: () => Promise<T>) => withReplyCancellation(replyRun, operation);
+    const typingController = new AbortController();
+    activeInboxTyping = typingController;
+    if (inboxPreparationWaiters > 0) typingController.abort();
     // 这一层是**整批消息的最后一道防线**：消息在 consumeInboxMessages 那一刻就已经从
     // 收件箱里没了，下面任何一步抛出去的异常都会穿过整个 for 循环，剩下的消息既没落进
     // 聊天记录、也没回到收件箱——用户那边只看到「正在输入…」一直亮到 60s 点名判失败，
     // 角色的回复彻底消失。所以整段都得包住，不能只包后处理那一小截。
     try {
+      // Usage must survive reloads, cancellation and replay of an already persisted chat bubble.
+      // The Worker only attaches model-call records to the final segment; commit before message dedup.
+      if (isInstantReply && message.taskUuid && (message.metadata as any)?.amsgModelCalls) {
+        await settleInstantChatApiLog(message.taskUuid, message.metadata);
+      }
       // 'active-msg-received' 事件里的 sentAt 维持原口径（发送时刻优先）：
       // 它只喂 toast / 未读预览，不进聊天记录，别跟落库口径搅在一起。
       const eventSentAt = message.sentAt || message.receivedAt || Date.now();
@@ -1716,7 +1715,9 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
       // 见上面 isAlreadyPersisted 的注释：这条已经在聊天记录里了（补收先到、真推送迟到，
       // 或重试重跑的重叠段），第二份原样丢弃。
       if (!(message.processAttempts && message.processAttempts > 0)
-        && await replyStep(async () => isAlreadyPersisted(message.charId, message.messageId))) {
+        && await replyStep(async () => ((message.metadata as any)?.amsgActionResult === true
+          && await ActiveMsgStore.hasAppliedActionResult(message.charId, message.messageId))
+          || await isAlreadyPersisted(message.charId, message.messageId))) {
         log.warn('这条消息已在聊天记录里（补收先到/重试重跑的第二份），丢弃', { messageId: message.messageId, charId: message.charId });
         activeMsgTrace('runtime-inbox-duplicate-dropped', { messageId: message.messageId, charId: message.charId });
         continue;
@@ -1755,96 +1756,21 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
       }
 
       // 角色到点自己给自己排的任务：worker 直接在 D1 建了行，客户端这边并不知道它存在。
-      // 记账排在防穿帮闸**之前**——「这条消息该不该说出口」和「这条任务存不存在」是两回事。
-      // 排在闸后面的话，被吞的那条 push 会把任务认领一起带走：面板列不出来、用户取消不掉，
-      // 而它照常到点触发；订阅登记和凭据刷新也都够不着它，成了推不出去又删不掉的幽灵。
+      // 先认领任务，再处理正文，让设置页和后续排程都能看见这批任务。
       await replyStep(async () => adoptSelfScheduledTasks(message));
       // 对称的另一半：角色在 fire 里取消 / 改期掉的既有任务，本地清单跟着消账。
-      // 同样排在闸之前——D1 行已经没了（或换了时间），消息被吞不改变这个事实。
+      // D1 行已经没了（或换了时间），本地清单跟着更新。
       await replyStep(async () => applyRemoteTaskMutations(message));
 
-      // ─── 防穿帮闸·客户端兜底 ───
-      // 只拦定时任务的 push（source==='scheduled' 且带策略字段）；instant 聊天
-      // 回复 source==='instant'，与这道闸无关。吞掉 = 不进聊天流、不重放
-      // directives（作废消息的副作用一并作废）；生成 token 浪费掉，换不穿帮。
-      // 系统通知层面：content push 默认可能在前台/后台先展示；页面线程无权追回
-      // 已弹通知。防通知主力是 worker 预检 + chat_presence 活跃会话租约。
-      // 排程现状块不在这里记——useChatAI 组请求时独立检出，两侧结论一致。
-      if (message.source === 'scheduled' && (message.metadata as any)?.amsgExpirePolicy) {
-        // 缓存键必须含 occurrence（Codex #2）：sessionId 对循环任务的每次 occurrence、
-        // 对同一次的每次重试都可能重复——裸 sessionId 会把上次的判定串给下一次
-        // （第一次放行 → 后续永远放行；第一次吞 → 后续全吞）。公式见 buildFireKey。
-        const fireKey = buildFireKey(message);
-        const now = Date.now();
-        // 多分段 push 的一次 fire 共用一个决定（同吞同放）：get-or-compute + TTL 清扫
-        // 抽进 resolveFireExpireDecision，见其单测。
-        let expired: boolean;
-        try {
-          expired = await replyStep(async () => resolveFireExpireDecision(
-            expireDecisionByFire,
-            fireKey,
-            now,
-            () => evaluateScheduledPushExpired(message),
-          ));
-        } catch (gateErr) {
-          // 判不出来「用户此刻是不是正在跟这个角色聊天」。压回收件箱等本地存储缓过来再判，
-          // 别猜——猜错的那一面是角色当着正在进行的对话冒出一句定时问候。
-          // （evaluate 抛错时 resolveFireExpireDecision 不写缓存，所以下次是真的重判。）
-          const attempts = (message.processAttempts ?? 0) + 1;
-          if (attempts < MAX_INBOX_PROCESS_ATTEMPTS) {
-            log.warn('防穿帮闸判定失败，压回收件箱稍后重判', { messageId: message.messageId, attempts, error: gateErr });
-            await replyStep(async () => requeueForRetry(message, attempts));
-            notifyInboxProcessFailed(message, 'retrying', '防穿帮闸');
-            continue;
-          }
-          // 压到上限还是判不了：本地存储这时候基本是真出问题了，让角色继续冒新消息只会更乱。
-          // 按吞掉处理（与闸判定为「已作废」同一个出口），但要明确告诉用户有这么一条被跳过了。
-          log.error('防穿帮闸重试到上限仍判不了，按作废吞掉', { messageId: message.messageId, attempts, error: gateErr });
-          activeMsgTrace('runtime-expire-swallow-unknown', {
-            sessionId: fireKey,
-            messageId: message.messageId,
-            charId: message.charId,
-            taskId: message.taskId,
-            taskUuid: message.taskUuid,
-          });
-          notifyInboxProcessFailed(message, 'swallowed', '防穿帮闸');
-          continue;
-        }
-        if (expired) {
-          activeMsgTrace('runtime-expire-swallow', {
-            sessionId: fireKey,
-            messageId: message.messageId,
-            charId: message.charId,
-            taskId: message.taskId,
-            taskUuid: message.taskUuid,
-          });
-          // 吞掉的是「这次要说的话」，云端那份「我说过什么」也得跟着撤，否则下一次到点
-          // 角色会接着一句没人看过的话往下说。不 await：这是一次网络往返，不能让它拖住
-          // 收件箱里后面几条的落库；失败只 warn（见 revokeSwallowedSelfLogEntry）。
-          const selfLogEntryId = buildSelfLogEntryId(message);
-          if (selfLogEntryId) {
-            void revokeSwallowedSelfLogEntry(message.charId, selfLogEntryId)
-              .catch((e) => log.warn('撤销云端自述日志条目失败（下次重传 fire_pack 时整份作废）', {
-                charId: message.charId, entryId: selfLogEntryId, error: e,
-              }));
-          }
-          continue;
-        }
-      } else if (message.source === 'scheduled') {
-        // 这条定时 push 没带策略字段（老 worker 发的），闸整个没跑。留一行把它跟
-        // 「闸跑了、放行了」区分开——不然排查时两者长得一模一样，只能靠别的 trace
-        // 反推，而反推恰恰是这条链路最不该有的东西。
-        activeMsgTrace('runtime-expire-gate-skipped', {
-          messageId: message.messageId,
-          charId: message.charId,
-          taskId: message.taskId,
-          taskUuid: message.taskUuid,
-          reason: 'no-policy-field',
+      // 推送已经发出，系统通知可能已被用户读到，客户端只负责接收。
+      // 是否避让聊天由 Worker 发送前判定；停止回复走独立的 UUID 守卫。
+      if (message.source === 'scheduled') {
+        activeMsgTrace('runtime-scheduled-delivery-accepted', {
+          messageId: message.messageId, charId: message.charId, taskUuid: message.taskUuid,
         });
       }
 
-      // 多段消息的等齐守卫：前面的段还没着落就先扣住这条（见 holdUntilEarlierChunksLand）。
-      // 排在防穿帮闸后面——这次 fire 整个被吞掉的话，没必要为它的后半段白等几秒。
+      // 后段先到仍要等前段，保持原有的保序与有限重试。
       if (await replyStep(async () => holdUntilEarlierChunksLand(message, pendingMessages))) continue;
 
       // 落库时间戳按「在线送达 vs 离线补收」二选一（undefined = 交给 DB.saveMessage 默认取
@@ -1869,7 +1795,7 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
 
       if (looksLikeAssistantText) {
         try {
-          await replyStep(async () => processInboxMessageWithPostProcessing(message, persistTimestamp, replyRun));
+          await replyStep(async () => processInboxMessageWithPostProcessing(message, persistTimestamp, replyRun, typingController.signal));
           routed = true;
         } catch (postErr) {
           if (replyRun?.signal.aborted || isReplyStopped(message.taskUuid)) continue;
@@ -1976,6 +1902,7 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
               startLateEmotionPoll(message.charId, degradedPendingRef, message.charName || '', { taskUuid: message.taskUuid });
             } else {
               // 标了 pending 却没给引用键（worker bug）：没法轮询，按「有结论但没结果」收尾。
+              settleLateCloudEmotionEvalLog(message.taskUuid, false);
               announceChatGen(CHAT_GEN_EVENTS.emotionFailed, {
                 charId: message.charId, charName: message.charName || '',
                 reason: '云端情绪评估晚投但缺少引用键（worker 可能有 bug），这一轮不更新',
@@ -1992,7 +1919,11 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
       }
 
       // 走到这里 = 这条真的落进聊天流了（主路径落库完 / 降级存了原稿）。上面每一个
-      // continue 都是「没上屏」：闸吞了、跟已有的重了、等前面的分段、压回收件箱重试。
+      // continue 都是「没上屏」：跟已有的重了、等前面的分段、压回收件箱重试。
+      if ((message.metadata as any)?.amsgActionResult === true) {
+        // 回执在本地成功落盘后才进入本趟成功名单；写失败由外层重排，不能先 ACK。
+        await ActiveMsgStore.markActionResultApplied(message.charId, message.messageId);
+      }
       landedMessageIds.push(message.messageId);
 
       // 不管走 post-processing 还是 raw fallback, 单条 inbox message 触发一次 'active-msg-received',
@@ -2002,6 +1933,7 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
           charId: message.charId,
           charName: message.charName,
           body: message.previewBody || message.body,
+          ...((message.metadata as any)?.nativeNotificationHandled === true ? { nativeNotificationHandled: true } : {}),
           avatarUrl: message.avatarUrl,
           sentAt: eventSentAt,
         },
@@ -2019,17 +1951,19 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
       // 认末段（messageIndex >= totalMessages）而不是随便哪一段：第一段就销账的话，
       // 后续段丢在路上时兜底同样全停，用户永远只看到半截回复。段号缺失（单段消息 /
       // 旧 worker）当末段处理，保持旧行为。
+      const segIndex = Number((message.metadata as any)?.messageIndex);
+      const segTotal = Number((message.metadata as any)?.totalMessages);
+      const isLastSegment = !Number.isFinite(segTotal) || segTotal <= 1
+        || (Number.isFinite(segIndex) && segIndex >= segTotal);
       const pendingForChar = getInstantChatPending(message.charId);
       if (pendingForChar && message.taskUuid === pendingForChar.uuid) {
-        const segIndex = Number((message.metadata as any)?.messageIndex);
-        const segTotal = Number((message.metadata as any)?.totalMessages);
-        const isLastSegment = !Number.isFinite(segTotal) || segTotal <= 1
-          || (Number.isFinite(segIndex) && segIndex >= segTotal);
         if (isLastSegment && clearInstantChatPending(message.charId)) {
           scheduleNextInstantChatStatusCheck();
           // 「API 调用记录」里那笔（发出去时记的）在这里补完：用量挂在末条推送上，
           // 而这里正好是认末段的地方。
-          settleInstantChatApiLog(pendingForChar.uuid, message.metadata as Record<string, any> | null);
+          if (!(message.metadata as any)?.amsgModelCalls) {
+            await settleInstantChatApiLog(pendingForChar.uuid, message.metadata as Record<string, any> | null);
+          }
           // 随这一轮上云的「任务被作废」回执到这里才真的销账。发出时（worker 回 202）
           // 只是记账：202 仅表示受理，那一轮要是整个失败了，回执得留着下轮重新注入，
           // 否则角色永远不知道自己许过的那条排程已经没了。认 uuid，上一轮迟到的结论
@@ -2038,10 +1972,11 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
           // 这条回复是从 outbox 补收回来的 = 真推送没送到 = 那条任务行多半正挂在
           // 2/4/6 分钟的重试队列里，跑起来就是同一轮的第二份回复。尽力取消；
           // 正常送达的路不带这个标记（行发完即删，也无从取消），一个多余请求都不发。
-          if ((message.metadata as any)?.amsgOutboxBackfill) {
+          if ((message.metadata as any)?.amsgOutboxBackfill && await isGloballyEnabledNow()) {
             // 取消失败别静默吞：重试跑起来就是同一轮的第二份回复（重叠段有上面的
             // messageId 去重兜着，多出的段拦不住），至少留下一条可查的痕。
             ActiveMsgClient.cancelTask(pendingForChar.uuid).catch((e) => {
+              if (isAmsgGlobalDisabledError(e)) return;
               log.warn('补收销账后取消重试任务失败（若重试已在跑，重复段会被落库去重拦下）', { uuid: pendingForChar.uuid, error: e });
             });
           }
@@ -2058,6 +1993,8 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
           // 不收尾（不推进回合、不写事件 / 用户外显），按「失败不扣回合」处理。
           await replyStep(async () => settleInstantChatSarModule(message));
         }
+      } else if (!isInstantReply && isLastSegment) {
+        void recordProactiveCloudApiLog(message);
       }
     } catch (stageErr) {
       if (replyRun?.signal.aborted || isReplyStopped(message.taskUuid)) continue;
@@ -2070,6 +2007,7 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
         });
       }
     } finally {
+      if (activeInboxTyping === typingController) activeInboxTyping = null;
       try { await replyRun?.settle(); }
       catch (error) { log.error('停止回复的本地收尾失败', { messageId: message.messageId, error }); }
       if (replyRun?.signal.aborted) {
@@ -2078,19 +2016,84 @@ const flushInboxToChatImpl = async (trigger: FlushTrigger): Promise<string[]> =>
     }
   }
   } finally {
+    for (const id of batchCharIds) {
+      const remaining = (inFlightInboxCharacters.get(id) ?? 1) - 1;
+      if (remaining > 0) inFlightInboxCharacters.set(id, remaining);
+      else inFlightInboxCharacters.delete(id);
+    }
     // 有着落的那些去云端账本上销账。这一步是纯收尾：销不掉只是下次会再拉回来一趟，
     // 落库那层的去重会把它挡下，所以不 await、失败也只 warn，不连累已经落库的事实。
     const settled = pendingMessages
       .map((m) => m.messageId)
       .filter((id) => !!id && !retainedInboxMessageIds.has(id));
     retainedInboxMessageIds.clear();
-    if (settled.length > 0) {
+    if (settled.length > 0 && await isGloballyEnabledNow()) {
       void ActiveMsgClient.ackOutboxMessages(settled).catch((e) => {
+        if (isAmsgGlobalDisabledError(e)) return;
         log.warn('云端账本销账失败（下次拉回来会被去重挡下）', { count: settled.length, error: e });
       });
     }
   }
   return landedMessageIds;
+};
+
+/**
+ * 定时主动消息末段入库后，把这一轮云端模型调用写进「设置 → API 调用记录」。
+ *
+ * 固定文案（fixed）不调模型、不入账；其余定时触发（面板排程、角色自排、离开后消息、见面离开提醒、
+ * 纯动作回执）都在云端实打实调了对话模型。凭据不随推送回传，按角色当前默认对话 API 归属。
+ */
+const recordProactiveCloudApiLog = async (message: ActiveMsg2InboxMessage): Promise<void> => {
+  try {
+    if (message.messageType === 'fixed') return;
+    const meta = (message.metadata ?? {}) as Record<string, any>;
+    const usage = meta.amsgUsage && typeof meta.amsgUsage === 'object' ? meta.amsgUsage : null;
+    const isLlmProactive = Boolean(usage)
+      || meta.amsgActionResult === true
+      || message.messageType === 'auto'
+      || message.messageType === 'prompted';
+    if (!isLlmProactive) return;
+
+    const chars = await DB.getAllCharacters().catch(() => []);
+    const char = chars.find((c) => c.id === message.charId);
+    const apiCfg = loadApiConfigFromLocalStorage();
+    const effectiveApi = char ? resolveDialogueApi(apiCfg, char) : apiCfg;
+
+    const purpose = meta.amsgActionResult === true
+      ? '主动消息（纯动作）'
+      : (meta.amsgProactiveKind === 'away' || meta.amsgAway === true)
+        ? '离开后消息'
+        : (meta.amsgProactiveKind === 'dateLeave' || meta.amsgDateLeave === true)
+          ? '见面离开提醒'
+          : (meta.amsgProactiveKind === 'self'
+            || meta.amsgSelfScheduled === true
+            || char?.activeMsg2Config?.tasks?.some((t) => t.taskUuid === message.taskUuid && t.source === 'character'))
+            ? '角色自排提醒'
+            : '主动消息';
+
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    const occKey = meta.amsgOccurrenceMs ?? message.occurrenceMs ?? message.sentAt ?? message.messageId;
+    recordCompletedCloudApiCall({
+      id: `cloud-proactive-${message.taskUuid || message.messageId}:${occKey}`,
+      route: 'cloud-proactive',
+      baseUrl: effectiveApi.baseUrl,
+      model: effectiveApi.model,
+      ok: true,
+      timestamp: message.sentAt || message.receivedAt || Date.now(),
+      promptTokens: num(usage?.promptTokens),
+      completionTokens: num(usage?.completionTokens),
+      tokensPartial: meta.amsgTokensPartial === true,
+      meta: {
+        appId: 'chat',
+        appName: '消息',
+        charId: message.charId,
+        charName: char?.name || message.charName,
+        purpose,
+      },
+    });
+  } catch {
+    // 观测记录失败绝不连累已落库的主动消息
+  }
 };
 
 /**
@@ -2139,6 +2142,7 @@ const settleInstantChatSarModule = async (message: ActiveMsg2InboxMessage): Prom
  * 插回正确位置）。尽力而为：失败就算了，正常路径什么都扫不到。
  */
 const sweepSettledInstantRound = async (charId: string, uuid: string): Promise<void> => {
+  if (!(await isGloballyEnabledNow())) return;
   const entries = await drainOutboxAndFlush('轮询补收');
   if (entries === null) {
     log.warn('即时对话销账后补扫没读成（缺段只能等下一轮顺带）', { charId, uuid });
@@ -2158,7 +2162,7 @@ let flushChain: Promise<unknown> = Promise.resolve();
  *
  * 返回**这一趟真正落进聊天流**的 messageId 名单。绝大多数调用方不看它（冲刷是纯副作用），
  * 但手动补收要拿它跟自己写进收件箱的名单对一次才敢说「补回了 N 条」——写进收件箱只是
- * 排上队，防穿帮闸、落库去重、多段等齐都可能把它拦在上屏之前。整趟挂掉时返回空数组
+ * 排上队，落库去重、多段等齐都可能把它拦在上屏之前。整趟挂掉时返回空数组
  * （异常在这里吞掉，跟原来一样不外抛）。
  *
  * （导出仅为让 activeMsgRuntime.test.ts 走真库钉「主路径 / 降级路径落库时间戳同口径」，
@@ -2169,10 +2173,10 @@ let flushChain: Promise<unknown> = Promise.resolve();
  * 立刻，后者最坏差一分钟）。设成必填而不是给个默认值，是为了让新加的调用点漏传时
  * 编译就报错，而不是静默记成一个查不出所以然的「未知」。
  */
-export const flushInboxToChat = (trigger: FlushTrigger): Promise<string[]> => {
+export const flushInboxToChat = (trigger: FlushTrigger, charId?: string): Promise<string[]> => {
   const next = flushChain.then(async () => {
     try {
-      return await flushInboxToChatImpl(trigger);
+      return await flushInboxToChatImpl(trigger, charId);
     } catch (e) {
       log.warn('flushInboxToChat failed', { trigger, error: e });
       return [];
@@ -2180,6 +2184,85 @@ export const flushInboxToChat = (trigger: FlushTrigger): Promise<string[]> => {
   });
   flushChain = next;
   return next;
+};
+
+/**
+ * 生成前收件的结果：
+ *   - completed：当前角色已到本机的消息都落库了；
+ *   - pending：还有消息留在收件箱（多段没到齐被扣住 / 处理失败等重试）；
+ *   - timeout：等满 30 秒还没跑完；
+ *   - stalled：这一趟已经让上一次生成等到超时、到现在还没跑完，这次不再等。
+ */
+export type InboxPreparationResult = 'completed' | 'pending' | 'timeout' | 'stalled';
+type InboxPreparationOutcome = 'completed' | 'pending';
+const inboxPreparations = new Map<string, { done: Promise<InboxPreparationOutcome>; timedOut: boolean }>();
+const CHAT_INBOX_WAIT_MS = 30_000;
+
+const runInboxPreparation = async (charId: string): Promise<InboxPreparationOutcome> => {
+  // 当前角色在收件箱里的消息；等重试 / 等前段的那些归各自的定时器，这里不动。
+  const listMine = async () => (await ActiveMsgStore.countInboxMessages()) <= 0
+    ? []
+    : (await ActiveMsgStore.listInboxMessages()).filter((m) => m.charId === charId);
+  const mine = await listMine();
+  // 没有可收的、也没有这个角色的消息正在处理：无事可做，不排队也不留 trace。
+  // 别的角色的消息在收件箱里或处理中都不用等——那里面没有这个角色要的东西。
+  if (!mine.some((m) => !isAwaitingInboxTimer(m)) && inboxClaimsInProgress === 0 && !inFlightInboxCharacters.has(charId)) {
+    if (mine.length === 0) return 'completed';
+  } else {
+    // 要排到串行链后面等了：正在慢放的那个气泡立刻放完（之后轮到的由 inboxPreparationWaiters 管）。
+    activeInboxTyping?.abort();
+    await flushInboxToChat('生成前收件', charId);
+  }
+
+  const left = (await listMine()).length;
+  if (left === 0) return 'completed';
+  activeMsgTrace('runtime-before-chat-inbox-pending', { charId, count: left });
+  return 'pending';
+};
+
+/**
+ * 组装下一轮上下文前，尽快接收当前角色已经到本机的消息。
+ * 复用串行冲刷和原子认领，不另起并发消费者；等待期间连正在慢放的气泡也立即加速。
+ * 只等一趟、最多 30 秒：不串联云端补收，不等重试定时器；等待提示由聊天界面负责。
+ * 超时不取消已认领的消息，原管线继续处理。同一角色同时只跑一趟，连点不堆队；
+ * 一趟让人等到超时之后，它跑完之前的后续调用不再等（stalled）。
+ */
+export const prepareInboxBeforeChat = (charId: string): Promise<InboxPreparationResult> => {
+  let work = inboxPreparations.get(charId);
+  if (work?.timedOut) return Promise.resolve('stalled');
+  if (!work) {
+    const started = {
+      done: runInboxPreparation(charId).catch((error): InboxPreparationOutcome => {
+        log.warn('生成前收件没跑成（原收件管线照常处理）', { charId, error });
+        return 'pending';
+      }),
+      timedOut: false,
+    };
+    work = started;
+    inboxPreparations.set(charId, started);
+    void started.done.then(() => {
+      if (inboxPreparations.get(charId) === started) inboxPreparations.delete(charId);
+    });
+  }
+  const current = work;
+  const startedAt = performance.now();
+  inboxPreparationWaiters += 1;
+  return new Promise<InboxPreparationResult>(resolve => {
+    let settled = false;
+    const finish = (result: InboxPreparationResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      inboxPreparationWaiters -= 1;
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      current.timedOut = true;
+      activeMsgTrace('runtime-before-chat-inbox-timeout', { charId, waitedMs: Math.round(performance.now() - startedAt) });
+      finish('timeout');
+    }, CHAT_INBOX_WAIT_MS);
+    void current.done.then(finish);
+  });
 };
 
 // ─── 前台收件箱守望 ───
@@ -2230,7 +2313,9 @@ const scheduleLocalInboxWatch = (): void => {
   if (localInboxWatchTimer != null) clearTimeout(localInboxWatchTimer);
   localInboxWatchTimer = setTimeout(() => {
     localInboxWatchTimer = null;
-    void sweepLocalInbox().finally(() => scheduleLocalInboxWatch());
+    void sweepLocalInbox()
+      .then(() => sweepThirdPartyOutbox())
+      .finally(() => scheduleLocalInboxWatch());
   }, LOCAL_INBOX_WATCH_INTERVAL_MS);
 };
 
@@ -2238,14 +2323,15 @@ const scheduleLocalInboxWatch = (): void => {
 // 推送是会静默丢的（换网、代理断流、系统压制、SW 没醒）。云端每条推送发出去之前都在
 // 服务端账本上记了一行，客户端落库之后销账，所以「哪些没收下」是查得出来的事实。
 //
-// 拉账本的时机分两类，别混：
+// 拉账本的时机分三类，别混：
 //   1. 上线补收（catchUpMissedPushes）——冷启动、回到前台各一次，带节流。**不看有没有
 //      在等回复**。定时主动消息是云端到点自己发的，客户端从来不知道自己在等它，
 //      要是只在「欠着回复」时才拉，它的推送丢了就永远没人去捞（那正是这条路存在的理由）。
 //   2. 等回复时的点名（runInstantChatStatusCheck）——每 60s 一跳，下结论前必拉一次最新的。
 //      **不受节流管**：为省一次往返而跳过，就可能拿着旧账本去判「回复取不回」。
+//   3. 第三方推送模式的前台补收（sweepThirdPartyOutbox）——见那边的注释。
 //
-// 两类共用 drainOutboxAndFlush，也共用同一个节流时钟——点名拉过之后，紧跟着的上线补收
+// 三类共用 drainOutboxAndFlush，也共用同一个节流时钟——点名拉过之后，紧跟着的上线补收
 // 那一趟就会被挡下。
 //
 // 账本是按用户存的、不分角色，所以一趟就把所有角色欠的都捞回来了，不用逐个角色拉。
@@ -2263,7 +2349,10 @@ export const OUTBOX_CATCH_UP_MIN_INTERVAL_MS = 60_000;
 let lastOutboxDrainAt = 0;
 
 /** 只给单测用：把节流时钟拨回从没拉过的状态。 */
-export const resetOutboxCatchUpThrottleForTesting = (): void => { lastOutboxDrainAt = 0; };
+export const resetOutboxCatchUpThrottleForTesting = (): void => {
+  lastOutboxDrainAt = 0;
+  scheduledTasksCache = null;
+};
 
 /**
  * 「有 N 条太旧了，没能补回来」——广播出去让 OSContext 弹一句。
@@ -2301,15 +2390,94 @@ const drainOutboxAndFlush = async (trigger: FlushTrigger): Promise<AmsgOutboxEnt
         log.warn('账本上跳过的条目销账失败（下次会再捞一遍）', { count: ackNow.length, error: e });
       });
     }
-    // 超窗销掉的那些必须说一声。这条路是**开 App 就自动跑**的，销掉之后账本上就干净了：
-    // 用户后来去点「找回没收到的消息」，看到的是一句「账本上没有漏收的消息，这条链路是
-    // 通的」——他刚丢了消息，界面却在告诉他一切正常。这一句是那件事唯一的出口。
+    // 保留旧调用接口的计数处理；正文补收已取消年龄丢弃，当前返回 0。
     if (staleDropped > 0) notifyOutboxStaleDropped(staleDropped);
     if (written > 0) await flushInboxToChat(trigger);
     return entries;
   } catch (e) {
     log.warn('补收失败（等下一次时机再试）', { error: e });
     return null;
+  }
+};
+
+// ─── 第三方推送模式的前台补收 ───
+//
+// 选了 WxPusher / Bark / MeoW 之后，云端只把消息推给第三方 App，浏览器的 Service Worker
+// 一条都收不到：手机上的通知立刻弹了，页面却不知道有新消息，只能等下一次去云端账本拉。
+// 所以这个模式下页面在前台时自己去拉，按「下一条大概什么时候来」分三档：
+//   - 欠着即时回复：每 3 秒；
+//   - 本机任务清单里有定时任务快到点（到点前 1 分钟到到点后 5 分钟）：每 6 秒；
+//   - 其余时候：每 60 秒，兜住本机不知道时间的那些（失败重发、清单还没同步的任务等）。
+// 挂在本地巡查那条 3 秒链上，不另起定时器；后台时不拉。
+// 网页推送模式不跑这一段：SW 收到推送会直接写本地收件箱，本地巡查就够了。
+export const THIRD_PARTY_PENDING_DRAIN_INTERVAL_MS = 3_000;
+export const THIRD_PARTY_DUE_DRAIN_INTERVAL_MS = 6_000;
+export const THIRD_PARTY_SLOW_DRAIN_INTERVAL_MS = 60_000;
+/** 第三方模式下回到前台的补收只留这点防抖，挡掉几十毫秒内连跳的可见性事件。 */
+export const THIRD_PARTY_FOREGROUND_DEBOUNCE_MS = 3_000;
+/** 快档窗口：到点前多早开始勤拉、到点后多久还算「刚到点」（留出云端生成和重试的时间）。 */
+export const THIRD_PARTY_DUE_LEAD_MS = 60_000;
+export const THIRD_PARTY_DUE_TAIL_MS = 5 * 60_000;
+const RECURRENCE_PERIOD_MS: Record<ActiveMsg2TaskRecord['recurrenceType'], number> = {
+  none: 0,
+  daily: 24 * 60 * 60_000,
+  weekly: 7 * 24 * 60 * 60_000,
+};
+
+/**
+ * 有没有哪条定时任务正处在快档窗口里。纯函数，边界见单测。
+ *
+ * 重复任务发过一次之后，本机记录的下次时间可能还停在上一次（要等对账才同步），这里按
+ * 周期往后推到最近一次。跨夏令时那两天会差一小时，那两次退回慢档，不影响送达。
+ */
+export const isNearScheduledSend = (tasks: ActiveMsg2TaskRecord[], now: number): boolean =>
+  tasks.some((task) => {
+    if (task.status !== 'scheduled') return false;
+    let due = Date.parse(task.nextSendAt || task.firstSendTime);
+    if (!Number.isFinite(due)) return false;
+    const period = RECURRENCE_PERIOD_MS[task.recurrenceType] ?? 0;
+    if (period > 0 && due + THIRD_PARTY_DUE_TAIL_MS < now) {
+      due += Math.ceil((now - THIRD_PARTY_DUE_TAIL_MS - due) / period) * period;
+    }
+    return now >= due - THIRD_PARTY_DUE_LEAD_MS && now <= due + THIRD_PARTY_DUE_TAIL_MS;
+  });
+
+/** 读全部角色的任务清单有一定开销，缓存一小会儿；新排的任务最晚这么久之后被看见。 */
+const SCHEDULED_TASKS_CACHE_MS = 30_000;
+let scheduledTasksCache: { at: number; tasks: ActiveMsg2TaskRecord[] } | null = null;
+const readLocalScheduledTasks = async (): Promise<ActiveMsg2TaskRecord[]> => {
+  const now = Date.now();
+  if (scheduledTasksCache && now - scheduledTasksCache.at < SCHEDULED_TASKS_CACHE_MS) {
+    return scheduledTasksCache.tasks;
+  }
+  const tasks = (await DB.getAllCharacters()).flatMap((c) => c.activeMsg2Config?.tasks ?? []);
+  scheduledTasksCache = { at: now, tasks };
+  return tasks;
+};
+
+/**
+ * 第三方推送模式下，到点就拉一次云端账本。返回这一跳有没有真去拉（只为单测断言）。
+ * `now` 只给单测拨钟用。
+ */
+export const sweepThirdPartyOutbox = async (now = Date.now()): Promise<boolean> => {
+  try {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return false;
+    const config = await ActiveMsgStore.getGlobalConfig();
+    if (config?.pushMode !== 'third-party' || !isAmsg2WorkerActive(config)) return false;
+    const sinceLast = lastOutboxDrainAt > 0 ? now - lastOutboxDrainAt : Infinity;
+    if (listInstantChatPendings().length > 0) {
+      if (sinceLast < THIRD_PARTY_PENDING_DRAIN_INTERVAL_MS) return false;
+    } else {
+      // 快档都还没到就不用读任务清单。
+      if (sinceLast < THIRD_PARTY_DUE_DRAIN_INTERVAL_MS) return false;
+      if (sinceLast < THIRD_PARTY_SLOW_DRAIN_INTERVAL_MS
+        && !isNearScheduledSend(await readLocalScheduledTasks(), now)) return false;
+    }
+    await drainOutboxAndFlush('第三方补收');
+    return true;
+  } catch (e) {
+    log.warn('第三方推送模式的前台补收没跑成（下一跳还会再来）', { error: e });
+    return false;
   }
 };
 
@@ -2331,21 +2499,25 @@ const drainOutboxAndFlush = async (trigger: FlushTrigger): Promise<AmsgOutboxEnt
 export const catchUpMissedPushes = async (
   trigger: 'startup' | 'foreground' | 'manual',
 ): Promise<'drained' | 'throttled' | 'worker-unset' | 'failed'> => {
-  // 手动那趟是用户自己发现丢了消息才点的，不受节流管。
-  if (trigger !== 'manual'
-    && lastOutboxDrainAt > 0
-    && Date.now() - lastOutboxDrainAt < OUTBOX_CATCH_UP_MIN_INTERVAL_MS) {
-    return 'throttled';
-  }
-
   // 没配过 Worker 的用户一个请求都不该发。不靠 ensureWorkerReady 抛错来兜：那条路每次
   // 回前台都会 warn 一行，控制台会被刷满，而「没配」根本不是异常。
+  let thirdPartyPush = false;
   try {
     const config = await ActiveMsgStore.getGlobalConfig();
-    if (!config?.workerUrl?.trim()) return 'worker-unset';
+    if (!isAmsg2WorkerActive(config)) return 'worker-unset';
+    thirdPartyPush = config.pushMode === 'third-party';
   } catch (e) {
     log.warn('读不到主动消息配置，这趟补收先跳过', { error: e });
     return 'failed';
+  }
+
+  // 手动那趟是用户自己发现丢了消息才点的，不受节流管。第三方推送模式下页面收不到 SW
+  // 的消息，切回来、点通知进来正是用户等着看新消息的时刻，只留防抖不套 60 秒节流。
+  const minInterval = thirdPartyPush ? THIRD_PARTY_FOREGROUND_DEBOUNCE_MS : OUTBOX_CATCH_UP_MIN_INTERVAL_MS;
+  if (trigger !== 'manual'
+    && lastOutboxDrainAt > 0
+    && Date.now() - lastOutboxDrainAt < minInterval) {
+    return 'throttled';
   }
 
   const entries = await drainOutboxAndFlush(trigger === 'manual' ? '手动补收' : '上线补收');
@@ -2353,21 +2525,12 @@ export const catchUpMissedPushes = async (
 };
 
 /**
- * 用户在设置面板上手动点的那次补收：「我这两天有消息没收到，去账本上找找」。
- *
- * 跟自动那条路的两处不同，都因为「用户自己知道自己丢了消息」这一点：
- *   1. 不受节流管——点了就该去问；
- *   2. 头一趟也把账本存量当补收处理（treatBacklogAsMissed），不走「整批销账、一条不上屏」。
- *      自动路径分不清存量里哪些是真丢的、哪些是当时收到了只是老版本客户端不会销账，
- *      倒出来就是把用户收过的消息重放一遍；这个判断只有用户自己做得了。
- *
- * 时效窗口照旧（超过 OUTBOX_BACKFILL_MAX_AGE_MS 的只销账不上屏），所以 written 会
- * 小于 scanned——UI 拿这三个数字如实告诉用户「翻了多少条、补回来几条、几条太旧了」。
- * `stale` 单独给一个数而不是让 UI 拿 scanned-written 去减：那个差里还混着思维链、
- * 工具请求这些本来就不进聊天流的条目，减出来会把「丢了 3 条」说成「丢了 11 条」。
+ * 用户在设置面板上手动点的补收，不受自动补收的节流限制。
+ * 首次与后续、手动与自动都恢复服务端仍保留的正文，并按完整本地历史去重。
+ * 返回的 stale 保留接口兼容，普通正文不再因48小时期限被丢弃。
  *
  * `written` 数的是**真的上了屏**的条数，不是写进收件箱的条数：中间还隔着一趟冲刷，
- * 防穿帮闸、落库去重、多段等齐都会把消息拦在上屏之前。按收件箱那个数报的话，界面会
+ * 落库去重、多段等齐都会把消息拦在上屏之前。按收件箱那个数报的话，界面会
  * 说「补回 3 条，去聊天里看看」，用户翻遍聊天记录一条也找不到。
  *
  * 这条路不广播 active-msg-backfill-stale：用户正盯着这个按钮等结果，面板会把三个
@@ -2473,6 +2636,7 @@ const scheduleNextInstantChatStatusCheck = () => {
  */
 export const runInstantChatStatusCheck = async (): Promise<void> => {
   if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+  if (!(await isGloballyEnabledNow())) return;
   const pendings = listInstantChatPendings();
   // 计数器只留还在等的轮次（销账走别的路时这里顺手清，别攒垃圾）。
   const activeUuids = new Set(pendings.map((p) => p.uuid));
@@ -2682,6 +2846,10 @@ export const refreshPushSubscriptionIfMarked = async (): Promise<'no-marker' | '
     return 'no-marker';
   }
   if (!marked) return 'no-marker';
+  if (!(await isGloballyEnabledNow())) {
+    // 总开关暂停期间不向 Worker 登记新订阅，保留标记待恢复开启时再补登，也不记失败统计。
+    return 'kept';
+  }
 
   try {
     await ActiveMsgClient.registerPushSubscription();
@@ -2697,14 +2865,17 @@ export const refreshPushSubscriptionIfMarked = async (): Promise<'no-marker' | '
   }
 };
 
-const handleDeepLink = () => {
+const handleDeepLink = async () => {
+  const { takeSpaceNotificationTarget } = await import('./userSpaceNavigation');
+  const pendingCharId = takeSpaceNotificationTarget();
   const currentUrl = new URL(window.location.href);
   const charId = currentUrl.searchParams.get('activeMsgCharId');
   const openApp = currentUrl.searchParams.get('openApp');
 
-  if (openApp === 'chat' && charId) {
+  const destination = openApp === 'chat' && charId ? charId : pendingCharId;
+  if (destination) {
     window.dispatchEvent(new CustomEvent('active-msg-open', {
-      detail: { charId },
+      detail: { charId: destination },
     }));
   }
 
@@ -2717,6 +2888,21 @@ const handleDeepLink = () => {
     // Keep same-page navigation markers (for example the browser back guard)
     // while removing only the consumed deep-link parameters from the URL.
     window.history.replaceState(window.history.state, '', currentUrl.toString());
+  }
+};
+
+/** 全局总开关暂停时撤掉云端状态轮询与晚投情绪补落定时器。 */
+export const pauseActiveMsgRuntime = (): void => {
+  if (instantChatStatusPollTimer != null) {
+    clearTimeout(instantChatStatusPollTimer);
+    instantChatStatusPollTimer = null;
+  }
+  instantStatusCheckFailures.clear();
+  for (const [charId, entry] of [...lateEmotionPolls.entries()]) {
+    clearTimeout(entry.timer);
+    lateEmotionPolls.delete(charId);
+    settleLateCloudEmotionEvalLog(entry.taskUuid, false);
+    announceEmotionDone(charId);
   }
 };
 
@@ -2796,8 +2982,6 @@ export const ActiveMsgRuntime = {
         // 而只记「回来了」的话，前面那段空白到底是页面没在跑、还是在跑但没人喊它，
         // 事后分不出来。
         activeMsgTrace('runtime-page-visibility', { state: document.visibilityState });
-        if (document.visibilityState !== 'visible') return;
-        handlePageBecameVisible();
       });
       // 冷启动那一下（点通知才把 App 拉起来）没有 visibilitychange 可听，这里补一次：
       // 不补的话「回到前台的时刻」一直是 0，从通知进来的第一条判不出「送达时人不在」。
@@ -2817,15 +3001,11 @@ export const ActiveMsgRuntime = {
       });
     }
 
-    // 页面「刚活过来」的那一下，立刻数一眼收件箱，不用干等守望的下一跳。
-    // pageshow：iOS 把 App 挂起后恢复、以及 bfcache 前进/后退时会发，而 visibilitychange
-    //   不一定发——线上记录里就有「只见进后台、不见回前台」的断档。
-    // focus：切回窗口或标签页。
-    // 这两个可能跟 visibilitychange 撞在一起重复触发，但收件箱是「取出即删」、冲刷又都
-    // 走同一条串行链，重复最多是多数一次个数，不会把同一条消息演两遍。
-    if (typeof window !== 'undefined') {
-      window.addEventListener('pageshow', () => { void sweepLocalInbox(); });
-      window.addEventListener('focus', () => { void sweepLocalInbox(); });
+    // Every resume signal uses the same local + cloud catch-up. Only checking the local
+    // inbox misses third-party deliveries whose bodies are still in the Worker outbox.
+    // The subscription coalesces bursts; existing outbox throttling and dedup stay in force.
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      subscribePageForeground(handlePageBecameVisible);
     }
 
     // 受理一轮即时对话之后（useChatAI 那边写记录 + 广播），把点名周期排上。
@@ -2863,6 +3043,12 @@ export const ActiveMsgRuntime = {
     // 点「更新 Worker」一样；对得上就敲一下让它按指纹自查。前端刚更新往往意味着后端也该更新，
     // 不必干等它 cron 上那几个小时。没配 Worker 的用户在里面就返回了。
     void requestStartupUpdateCheck();
+    // 救援模式（RESCUE）安全警告：只要连着 2.0 Worker 就问一次，回到前台够久了再问。
+    // 不跟上面那次共用 6 小时节流——警告晚到几小时，就是让人多蒙在鼓里几小时。
+    void probeRescueOnStartup();
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      subscribePageForeground(() => { void probeRescueOnForeground(); });
+    }
     // 上次会话发出去、回来前进程就没了的那一轮：指示灯靠 localStorage 记录挂回来，
     // 内容靠云端点名那一步补回来（它自带补收，还顺手把 60s 的点名周期排上）。
     if (listInstantChatPendings().length > 0) {
@@ -2873,6 +3059,6 @@ export const ActiveMsgRuntime = {
     });
     // 收件箱守望开跑。放在最后：上面那趟启动冲刷已经把积压清干净了，这里接管后续。
     scheduleLocalInboxWatch();
-    handleDeepLink();
+    await handleDeepLink();
   },
 };

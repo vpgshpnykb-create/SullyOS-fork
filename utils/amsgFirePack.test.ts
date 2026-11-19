@@ -13,6 +13,7 @@ import {
   describeFirePackVersion,
   SELF_LOG_MAX_ENTRIES,
   SELF_LOG_TEXT_MAX,
+  AMSG_SLOT_LIVE_CHAT,
   appendSelfLogEntry,
   buildAwayHint,
   buildUserClockHint,
@@ -23,16 +24,20 @@ import {
   formatFireTimeFull,
   formatFireTimeShort,
   formatTimeSinceUser,
+  isValidGzipForInput,
   parseFirePack,
   parseLastSkip,
   parseSelfLog,
   packStateValue,
+  registerGzipFallbackCompressor,
   reconcileSelfLogWithPack,
   renderFirePack,
   renderSelfLogBlock,
+  resetGzipCompressionStateForTests,
   resolveMaxUnansweredSends,
   unpackStateValue,
 } from './amsgFirePack';
+import { gzipSync } from 'fflate';
 
 // 回归守卫：这些期望值抄的是 activeMsgClient 拆槽位前（buildTimeGapHint /
 // buildLegacyStyleProactiveHint 内联时代）的旧文案。模板在前端维护、填槽在 worker 里跑，
@@ -225,6 +230,9 @@ describe('parseFirePack', () => {
 
   it('lastUserMessageAt 数字也合法', () => {
     expect(parseFirePack(JSON.stringify({ ...valid, lastUserMessageAt: 123 }))?.lastUserMessageAt).toBe(123);
+    expect(parseFirePack(JSON.stringify({ ...valid, lastAwayAnchorAt: 456 }))?.lastAwayAnchorAt).toBe(456);
+    expect(parseFirePack(JSON.stringify({ ...valid, lastAwayAnchorAt: null }))?.lastAwayAnchorAt).toBeNull();
+    expect(parseFirePack(JSON.stringify({ ...valid, lastAwayAnchorAt: 'bad' }))).toBeNull();
   });
 
   it('tzId 必填：缺失 / 空串 / 非字符串整包打回（渲染时间没有第二套算法可退）', () => {
@@ -299,7 +307,7 @@ describe('self_log', () => {
 
   // 回归守卫（炸屏事故的根）：连发计数以前挂在 basePackAt 上，客户端每认领一条推送就
   // 重传一次 fire_pack，计数被自己发的消息洗回零——在线时连排提醒永远不出现。
-  // 现在两段各管各的生死：entries 只认「用户开口了」，tasks 只认「fire_pack 换代了」。
+  // entries 只认「用户开口了」；tasks 只在同 UUID 已进入客户端 pendingTasks 后去重。
   describe('reconcileSelfLogWithPack', () => {
     const task = (uuid: string) => ({
       taskUuid: uuid, clientTaskId: `${uuid}-c`, mode: 'auto', firstSendTime: '2026-08-07T09:00:00.000Z',
@@ -321,10 +329,10 @@ describe('self_log', () => {
       expect(log.anchorUserMsgAt).toBe(500);
     });
 
-    it('fire_pack 换代（builtAt 变了）→ 只丢 tasks（已随 pendingTasks 回来），entries 原样保留', () => {
+    it('fire_pack 换代但没有逐项认领证明 → tasks 和 entries 原样保留', () => {
       const log = reconcileSelfLogWithPack(seeded(), { ...pack, builtAt: packAt + 1 }, 500);
       expect(log.entries.map((e) => e.text)).toEqual(['第一条', '第二条']);
-      expect(log.tasks).toHaveLength(0);
+      expect(log.tasks).toHaveLength(1);
       expect(log.basePackAt).toBe(packAt + 1);
     });
 
@@ -341,10 +349,10 @@ describe('self_log', () => {
       expect(reconcileSelfLogWithPack(seeded(), pack, null).entries).toHaveLength(2);
     });
 
-    it('换代与用户开口同时发生 → entries、tasks 都清', () => {
+    it('换代与用户开口同时发生 → 只清 entries，未认领任务仍保留', () => {
       const log = reconcileSelfLogWithPack(seeded(), { ...pack, builtAt: packAt + 1 }, 900);
       expect(log.entries).toHaveLength(0);
-      expect(log.tasks).toHaveLength(0);
+      expect(log.tasks).toHaveLength(1);
     });
   });
 
@@ -466,6 +474,61 @@ describe('self_log', () => {
     });
   });
 
+  // 即时回复结束后、客户端还没把聊天记录传上来的那段时间里，下一条定时消息只能从这里
+  // 读到角色刚说过什么。回复挂在「对方还没回」的标题下、或者被截到两百字，角色就接不上话。
+  describe('即时回复的条目', () => {
+    const now = Date.UTC(2026, 6, 30, 23, 0);
+    const reply = (text: string, at = now - 2 * 60_000) => ({ ...entry('instant@1', text, at), reply: true });
+
+    it('回复单独一个标题，不跟「对方还没回」的主动消息混在一起', () => {
+      const log = appendSelfLogEntry(createSelfLog(packAt), reply('好，那我八点叫你'));
+      const block = renderSelfLogBlock(log, now, { tzId: 'UTC' });
+      expect(block).toContain('【这之后你回了对方】');
+      expect(block).toContain('2分钟前　好，那我八点叫你');
+      expect(block).not.toContain('对方还没回');
+    });
+
+    it('回复之后又主动发过 → 两段各说各的，连发计数只挂在主动那段', () => {
+      let log = appendSelfLogEntry(createSelfLog(packAt), reply('好，那我八点叫你', now - 30 * 60_000));
+      log = appendSelfLogEntry(log, entry('t1@1', '起床啦', now - 3 * 60_000));
+      const block = renderSelfLogBlock(log, now, { tzId: 'UTC' });
+      expect(block.indexOf('【这之后你回了对方】')).toBeLessThan(block.indexOf('【这之后你又发过（对方还没回）】'));
+      expect(block).toContain('已连着主动找了对方 1 次');
+    });
+
+    it('回复留够长度：超过主动消息那条两百字的线也不截', () => {
+      const long = '长'.repeat(SELF_LOG_TEXT_MAX + 300);
+      const log = appendSelfLogEntry(createSelfLog(packAt), reply(long));
+      expect(log.entries[0].text).toHaveLength(SELF_LOG_TEXT_MAX + 300);
+      // 主动消息照旧按两百字截。
+      const proactive = appendSelfLogEntry(createSelfLog(packAt), entry('t1@1', long));
+      expect(proactive.entries[0].text).toHaveLength(SELF_LOG_TEXT_MAX);
+    });
+  });
+
+  describe('「你们此刻正聊着」那一行', () => {
+    const now = Date.UTC(2026, 6, 30, 23, 0);
+    const live: AmsgFirePack = {
+      ...pack,
+      template: `【开口之前】\n先对照上面的对话。${AMSG_SLOT_LIVE_CHAT}\n默认是说。`,
+    };
+
+    it('对方刚说过话 → 写明正聊着；过了十分钟这一行连带消失', () => {
+      expect(renderFirePack({ ...live, lastUserMessageAt: now - 3 * 60_000 }, now, '指令'))
+        .toContain('先对照上面的对话。\n你们此刻正聊着：小明同学3 分钟前还在跟你说话。\n默认是说。');
+      expect(renderFirePack({ ...live, lastUserMessageAt: now - 20_000 }, now, '指令')).toContain('小明同学刚刚还在跟你说话');
+      expect(renderFirePack({ ...live, lastUserMessageAt: now - 11 * 60_000 }, now, '指令'))
+        .toBe('【开口之前】\n先对照上面的对话。\n默认是说。');
+      expect(renderFirePack({ ...live, lastUserMessageAt: null }, now, '指令')).not.toContain('正聊着');
+    });
+
+    it('调用方给了更新的开口时刻（包还没传完）→ 按新的那份算', () => {
+      const stale = { ...live, lastUserMessageAt: now - 30 * 60_000 };
+      expect(renderFirePack(stale, now, '指令')).not.toContain('正聊着');
+      expect(renderFirePack(stale, now, '指令', { lastUserMessageAt: now - 60_000 })).toContain('1 分钟前还在跟你说话');
+    });
+  });
+
   it('renderSelfLogBlock 空日志返回空串', () => {
     const now = Date.UTC(2026, 6, 30, 23, 0);
     expect(renderSelfLogBlock(null, now, { tzId: 'UTC' })).toBe('');
@@ -584,8 +647,7 @@ describe('last_skip 新原因', () => {
   it('describeLastSkip 对每个原因都有人话（面板一行说明）', () => {
     expect(describeLastSkip({ ...base, reason: 'empty-generation' }, fmt)).toContain('没写出要说的话');
     expect(describeLastSkip({ ...base, reason: 'stale' }, fmt)).toContain('过去太久');
-    expect(describeLastSkip({ ...base, reason: 'active-chat-presence' }, fmt)).toContain('让路');
-    expect(describeLastSkip({ ...base, reason: 'conversation-moved-on' }, fmt)).toContain('过时');
+    expect(describeLastSkip({ ...base, reason: 'declined' }, fmt)).toContain('不用再说');
     expect(describeLastSkip({ ...base, reason: 'unanswered-limit' }, fmt)).toContain('连发上限');
   });
 
@@ -688,6 +750,100 @@ describe('client_state 值压缩', () => {
   it('数据损坏时解压抛错，不会把半截内容当正常值放过去', async () => {
     await expect(unpackStateValue('gz1:bm90LWd6aXAtYXQtYWxs')).rejects.toThrow();
   });
+
+  it('gzip 头尾完整性校验：认完整帧，拒截断帧、坏 CRC 与坏长度', () => {
+    const raw = new TextEncoder().encode(bigJson);
+    const full = gzipSync(raw);
+    expect(isValidGzipForInput(raw, full)).toBe(true);
+
+    // 截掉末尾（复现移动端 WebKit 未刷完 Z_FINISH 静默吐出半截流的形态）
+    expect(isValidGzipForInput(raw, full.subarray(0, full.byteLength - 10))).toBe(false);
+
+    // 篡改 CRC32（倒数第 8~5 字节）
+    const badCrc = full.slice();
+    badCrc[badCrc.byteLength - 8] ^= 0xff;
+    expect(isValidGzipForInput(raw, badCrc)).toBe(false);
+
+    // 篡改 ISIZE（倒数第 4~1 字节）
+    const badSize = full.slice();
+    badSize[badSize.byteLength - 4] ^= 0x01;
+    expect(isValidGzipForInput(raw, badSize)).toBe(false);
+
+    // 过短或非 gzip 头
+    expect(isValidGzipForInput(raw, new Uint8Array(10))).toBe(false);
+    const badMagic = full.slice();
+    badMagic[0] = 0x00;
+    expect(isValidGzipForInput(raw, badMagic)).toBe(false);
+  });
+
+  // 回归守卫：iOS WebKit 的 CompressionStream 在大输入收尾阶段可能不抛错、直接返回缺尾部的
+  // 半截 gzip。未注册纯 JS 兜底时必须丢弃半截包退回明文，绝不能把坏的 gz1: 传上云端。
+  it('原生 CompressionStream 静默返回半截 gzip 且无兜底时，退回完整明文而非产出损坏包', async () => {
+    const saved = globalThis.CompressionStream;
+    const prevFallback = registerGzipFallbackCompressor(null);
+    globalThis.CompressionStream = class TruncatedCompressionStream {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+      constructor() {
+        const ts = new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            const full = gzipSync(chunk);
+            controller.enqueue(full.subarray(0, full.byteLength - 12));
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    } as unknown as typeof CompressionStream;
+    try {
+      const packed = await packStateValue(bigJson);
+      expect(packed.startsWith('gz1:')).toBe(false);
+      expect(packed).toBe(bigJson);
+      expect(await unpackStateValue(packed)).toBe(bigJson);
+    } finally {
+      globalThis.CompressionStream = saved;
+      registerGzipFallbackCompressor(prevFallback);
+      resetGzipCompressionStateForTests();
+    }
+  });
+
+  it('原生 CompressionStream 静默截断时自动熔断并切到已注册的纯 JS gzip，后续调用不再碰坏构造器', async () => {
+    const saved = globalThis.CompressionStream;
+    let nativeCalls = 0;
+    const prevFallback = registerGzipFallbackCompressor((bytes) => gzipSync(bytes));
+    globalThis.CompressionStream = class TruncatedAndDetachingStream {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+      constructor() {
+        nativeCalls += 1;
+        const ts = new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            const full = gzipSync(chunk);
+            // 顺手模拟流消费侧转移底层 ArrayBuffer，确保调用方的原字节不受牵连。
+            structuredClone(chunk.buffer, { transfer: [chunk.buffer] });
+            controller.enqueue(full.subarray(0, full.byteLength - 10));
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    } as unknown as typeof CompressionStream;
+    try {
+      const first = await packStateValue(bigJson);
+      expect(first.startsWith('gz1:')).toBe(true);
+      expect(await unpackStateValue(first)).toBe(bigJson);
+      expect(nativeCalls).toBe(1);
+
+      const second = await packStateValue(bigJson);
+      expect(second.startsWith('gz1:')).toBe(true);
+      expect(await unpackStateValue(second)).toBe(bigJson);
+      expect(nativeCalls, '同一构造器熔断后本页不再重复试错').toBe(1);
+    } finally {
+      globalThis.CompressionStream = saved;
+      registerGzipFallbackCompressor(prevFallback);
+      resetGzipCompressionStateForTests();
+    }
+  });
 });
 
 // 回归守卫：升 fire_pack 版本要 worker bundle 和前端一起动，而设置页的版本门槛读的是
@@ -705,9 +861,9 @@ describe('fire_pack 版本对不上时说清该做什么', () => {
     expect(describeFirePackVersion(pack(FIRE_PACK_VERSION - 1))).toContain('前端比 worker 旧');
   });
 
-  it('新包（前端新、worker 旧）→ 让用户去重新粘贴部署', () => {
+  it('新包（前端新、worker 旧）→ 让用户去更新 Worker', () => {
     expect(parseFirePack(pack(FIRE_PACK_VERSION + 1))).toBeNull();
-    expect(describeFirePackVersion(pack(FIRE_PACK_VERSION + 1))).toContain('重新粘贴部署');
+    expect(describeFirePackVersion(pack(FIRE_PACK_VERSION + 1))).toContain('更新 Worker');
   });
 
   it('版本号对得上但别的字段坏了 → 不甩锅给部署', () => {

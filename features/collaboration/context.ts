@@ -123,7 +123,7 @@ export const buildCollaborationContextSnapshot = async ({
   if (mode === 'focused') {
     return [
       '[System: Focused Collaboration Character Context]\n',
-      ContextBuilder.buildRoleSettingsContext(char, { skipMemories: true }),
+      await ContextBuilder.buildRoleSettingsContext(char, { skipMemories: true }),
       char.description?.trim() ? `### 用户对你的备注/称呼\n${char.description.trim()}\n\n` : '',
       `### 互动对象\n- 名字: ${user.name}\n- 设定/备注: ${user.bio || '无'}\n\n`,
       `### 当前模式\n用户选择了“中度协同”：保留完整核心人格、世界观和用户设定；不载入世界书、用户印象或其它协同窗口。任务相关记忆会在每一次发送时重新召回，最多 5 条。\n\n`,
@@ -144,7 +144,7 @@ export const buildCollaborationContextSnapshot = async ({
     roomPlatesInjection: '',
   };
   return [
-    ContextBuilder.buildCoreContext(staticChar, user, true, undefined, undefined, {
+    await ContextBuilder.buildCoreContext(staticChar, user, true, undefined, undefined, {
       conversational: true,
       skipTimeAwareness: false,
     }),
@@ -215,6 +215,11 @@ export const buildLiveCollaborationChatContext = async ({
       customPrompt: (char as CharacterProfile & { thinkingChainCustomPrompt?: string }).thinkingChainCustomPrompt,
     },
     stripImages: true,
+    recallEntryPoint: 'collaboration',
+    appPrompt: {
+      rules: '当前位于独立协同工作窗口。私聊仅为背景资料，按下方协同规则完成当前窗口的任务。',
+      scene: '',
+    },
   });
 
   const fullChatContext: CollaborationContextMessage[] = payload.fullMessages
@@ -239,6 +244,7 @@ export const buildLiveCollaborationChatContext = async ({
         : `### ChatApp 实时聊天衔接\n最近 ${history.length} 条聊天会在每次生成时重新读取而非冻结。\n\n`,
       COLLABORATION_PROTOCOL,
       collaborationRichOutputPrompt(char, emojis, categories),
+      collaborationThinkingPrompt(char, user),
     ].join(''),
     chatContextSnapshot: [
       { role: 'system', content: history.length > 0

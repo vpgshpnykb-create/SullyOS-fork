@@ -10,14 +10,15 @@ import { flushFishingDeliveries } from './fishingDelivery';
 import {ensureDinosaurGarden,setGardenVisits,editDino,gardenResidents,findGardenSpace} from './dinosaurGarden';
 const mocks=vi.hoisted(()=>({messages:[] as any[],board:{id:'board',messages:[] as any[],updatedAt:0}}));
 vi.mock('../db',()=>({DB:{
+    ensureHomeContextMessages:vi.fn(async()=>{}),
     getVRNovels:vi.fn(async()=>[]),getVRMusicRoom:vi.fn(async()=>null),getEmojis:vi.fn(async()=>[]),getEmojiCategories:vi.fn(async()=>[]),
-    getRecentMessagesByCharId:vi.fn(async(id:string)=>mocks.messages.filter(m=>m.charId===id)),getVRCardsByCharId:vi.fn(async(id:string)=>mocks.messages.filter(m=>m.charId===id)),
+    getRecentMessagesByCharId:vi.fn(async(id:string)=>mocks.messages.filter(m=>m.charId===id)),getVRCardsByCharId:vi.fn(async(id:string)=>mocks.messages.filter(m=>m.charId===id)),getVRMarketEventIds:vi.fn(async(id:string)=>mocks.messages.filter(m=>m.charId===id).map(m=>m.metadata?.marketEventId).filter(Boolean)),
     saveMessageOnce:vi.fn(async(key:string,m:any)=>{const found=mocks.messages.find(x=>x.charId===m.charId&&x.metadata?.deliveryId===key);if(!found)mocks.messages.push({...m,metadata:{...m.metadata,deliveryId:key}});return 1;}),
     appendVRGuestbookMessages:vi.fn(async(messages:any[])=>{for(const m of messages)if(!mocks.board.messages.some(x=>x.id===m.id))mocks.board.messages.push(m);}),
     saveMessage:vi.fn(async(m:any)=>{mocks.messages.push(m);return 1;}),getVRGuestbook:vi.fn(async()=>mocks.board),saveVRGuestbook:vi.fn(async(b:any)=>{mocks.board=b;}),
 }}));
 vi.mock('../chatRequestPayload',()=>({buildChatRequestPayload:vi.fn(async()=>({systemPrompt:'ORIGINAL PERSONA',cleanedApiMessages:[]}))}));
-vi.mock('../safeApi',()=>({safeFetchJson:vi.fn()}));
+vi.mock('../safeApi',async importOriginal=>({...await importOriginal<typeof import('../safeApi')>(),safeFetchJson:vi.fn()}));
 vi.mock('../memoryPalace/autoArchive',()=>({processNewMessagesWithAutoArchive:vi.fn(async()=>{})}));
 vi.mock('../../context/MusicContext',()=>({loadMusicCfgStandalone:vi.fn(()=>({}))}));
 vi.mock('./vrApi',()=>({getVRApi:vi.fn(async()=>null),logVRApiCall:vi.fn()}));
@@ -131,7 +132,7 @@ it('API failure retains exactly one catch and retries the same snapshot',async()
     vi.mocked(safeFetchJson).mockRejectedValueOnce(Error('offline'));
     expect((await runVRSession({...deps,forcedSARActivity:'fishing'})).ok).toBe(false);
     const before=readFishingMarketState();expect(before.inventory).toHaveLength(1);expect(before.fishingTrips![0].status).toBe('pending');
-    answer(JSON.stringify({disposition:'keep',reaction:'先留下。',shareToUser:null}));
+    vi.mocked(safeFetchJson).mockResolvedValueOnce({choices:[{message:{content:[{type:'text',text:'决定如下：\n```json\n{"disposition":" KEEP ","reaction":"先留下。",}\n```'}]}}]});
     expect((await runVRSession({...deps,forcedSARActivity:'fishing'})).ok).toBe(true);
     const after=readFishingMarketState();expect(after.inventory[0]).toEqual(before.inventory[0]);expect(after.inventory).toHaveLength(1);expect(after.collectionEntries![0].acquisitionIds).toHaveLength(1);
     expect(mocks.board.messages).toHaveLength(1);expect(safeFetchJson).toHaveBeenCalledTimes(2);
@@ -139,7 +140,7 @@ it('API failure retains exactly one catch and retries the same snapshot',async()
 it('invalid JSON retains pending catch, and a model cannot release clay or invoke market',async()=>{
     vi.spyOn(Math,'random').mockReturnValue(.99999);
     answer(JSON.stringify({disposition:'release',reaction:'放回去',shareToUser:null}));
-    expect((await runVRSession({...deps,forcedSARActivity:'fishing'})).ok).toBe(false);
+    expect(await runVRSession({...deps,forcedSARActivity:'fishing'})).toMatchObject({ok:false,reason:'fishing-settlement',detail:'橡皮泥模型不能放生'});
     const id=readFishingMarketState().inventory[0].id;
     answer(JSON.stringify({disposition:'market',reaction:'卖了',shareToUser:null}));
     expect((await runVRSession({...deps,forcedSARActivity:'fishing'})).ok).toBe(false);

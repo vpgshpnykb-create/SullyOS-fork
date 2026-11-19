@@ -5,7 +5,6 @@ import { trackSARFeature } from '../utils/sarAnalytics';
 import { SARFamiliarityDialog } from './vrWorld/SARFamiliarityDialog';
 import { flushFishingDeliveries } from '../utils/vrWorld/fishingDelivery';
 import { flushMarketReceipts } from '../utils/vrWorld/fishingCharacter';
-import { loadCharacterContextMessageIds } from '../utils/chatContextRange';
 import React, { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react';
 import { useOS } from '../context/OSContext';
 import {
@@ -22,7 +21,7 @@ import { SARModuleShopOverlay } from './vrWorld/SARModuleShop';
 import { FishingMarketOverlay } from './vrWorld/FishingMarketOverlay';
 import { SARHubPanels, type SARHubPanel } from './vrWorld/SARHubPanels';
 const DinosaurGarden = React.lazy(() => import('./vrWorld/dinosaur/DinosaurGarden').then(m=>({default:m.DinosaurGarden})));
-import { CreatorIframe, type ChibiResult } from '../components/Like520Event';
+import { CreatorIframe, sullyPresets, type ChibiResult } from '../components/Like520Event';
 import { useMusic, type Song } from '../context/MusicContext';
 import { DB } from '../utils/db';
 import { LibraryView, NovelPreferenceModal } from './vrWorld/VRLibrary';
@@ -42,6 +41,7 @@ import { decodeBytes } from '../utils/vrWorld/decodeText';
 import { extractPdfText, isPdfFile } from '../utils/pdfText';
 import { stripLeakedAttrs } from '../utils/vrWorld/prompts';
 import { PostOffice, MAX_LETTER_CHARS, exportIdentity, importIdentity, getAdminToken, setAdminToken, type RemoteReply, type RemoteLetterStat, type RemoteAdminLetter } from '../utils/vrWorld/postOffice';
+import { SIGNAL_OWNERSHIP_RECOVERED } from '../utils/vrWorld/signalRecovery';
 import { Signal, getMyAuthorship, setSignalWhisper, hasSignalNoticeAck, ackSignalNotice, type SignalState } from '../utils/vrWorld/signal';
 import type { SignalPoem, SignalBooklet } from '../types';
 import { getVRApi, setVRApi, getVRApiLog, clearVRApiLog, type VRApiCall } from '../utils/vrWorld/vrApi';
@@ -106,10 +106,12 @@ const stripSelfName = (text: string | undefined, name: string | undefined): stri
     }
     return text;
 };
-import type { CharacterProfile, UserProfile, VRWorldNovel, VRNovelAnnotation, VRCardMeta, VRRoomId, VRMusicRoomState, CharPlaylistSong, VRGuestbookState, VRGuestbookMessage, VRLetter, ApiPreset, APIConfig } from '../types';
+import type { CharacterProfile, UserProfile, VRWorldNovel, VRWorldNovelSummary, VRNovelAnnotation, VRCardMeta, VRRoomId, VRMusicRoomState, CharPlaylistSong, VRGuestbookState, VRGuestbookMessage, VRLetter, ApiPreset, APIConfig } from '../types';
 
 // ============ chibi 形象解析（vrState.chibi → 立绘 → 头像） ============
 import { getChibi } from '../utils/vrWorld/chibi';
+import { HalloweenActions, HalloweenChibi, HalloweenDialogue, HalloweenPumpkins, KanataHalloweenProvider, useKanataHalloween } from './vrWorld/KanataHalloween';
+import type { HalloweenNpc } from '../utils/vrWorld/kanataHalloween';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 import { trackEvent } from '../utils/analytics';
 import { formatHours } from '../utils/format';
@@ -120,7 +122,6 @@ type Tab = 'world' | 'sar' | 'library' | 'settings' | 'api';
 interface FeedItem {
     msgId: number; charId: string; charName: string; avatar: string;
     timestamp: number; meta: VRCardMeta; content: string;
-    hidden: boolean; // 对 AI 上下文不可见（归档隐藏起点之前 / 记忆宫殿高水位之前）
 }
 
 // 每个房间的 chibi 站位（百分比坐标，底对齐）
@@ -149,6 +150,9 @@ const IDLE_QUIPS: Record<VRRoomId, string[]> = {
 };
 
 const VRWorldApp: React.FC = () => {
+    const halloween = useKanataHalloween();
+    const [halloweenNpc, setHalloweenNpc] = useState<HalloweenNpc | null>(null);
+    const [halloweenCharacter, setHalloweenCharacter] = useState<CharacterProfile | null>(null);
     const { closeApp, characters, characterGroups, updateCharacter, addToast, registerBackHandler, userProfile, updateUserProfile, apiPresets, apiConfig, groups, realtimeConfig, memoryPalaceConfig } = useOS();
     useEffect(() => {
         const flush = () => { void flushFishingDeliveries(characters).then(() => flushMarketReceipts(characters)).catch(() => {}); };
@@ -160,13 +164,14 @@ const VRWorldApp: React.FC = () => {
     const userName = userProfile?.name || '我';
     const [tab, setTab] = useState<Tab>(() => sarLaunch.peek() ? 'sar' : 'world');
     useEffect(() => { sarLaunch.consume(); }, []);
-    const [novels, setNovels] = useState<VRWorldNovel[]>([]);
+    const [novels, setNovels] = useState<VRWorldNovelSummary[]>([]);
     const [feed, setFeed] = useState<FeedItem[]>([]);
     const [poBadge, setPoBadge] = useState<{ toSend: number; toCollect: number }>({ toSend: 0, toCollect: 0 });
     const [loading, setLoading] = useState(true);
-    const [loadError, setLoadError] = useState(false);
+    const [loadError, setLoadError] = useState<string[]>([]);
+    const reloadGeneration = useRef(0);
     const feedLoadGeneration = useRef(0);
-    useEffect(() => () => { feedLoadGeneration.current++; }, []);
+    useEffect(() => () => { feedLoadGeneration.current++; reloadGeneration.current++; }, []);
 
     // 邮局徽标：本地待寄出/待发送 + 后端待收取的回信（best-effort 探测）
     const refreshPoBadge = useCallback(async () => {
@@ -189,6 +194,14 @@ const VRWorldApp: React.FC = () => {
     }, []);
 
     const [enterRoom, setEnterRoom] = useState<VRRoomId | null>(null);
+    useAppShortcut(ShortcutAppID.VRWorld, intent => {
+        setReaderNovel(null); setReaderJump(null); setShowUpload(false); setShowHelp(false);
+        setShowFishingMarket(null); setSarHubPanel(null); setShowSarModuleShop(false); setShowSarCabinet(false); setShowSarGacha(false); setShowSarDialogue(false); setFamiliarity(null);
+        const id = intent.entryId || 'world';
+        const isTab = ['world', 'library', 'sar', 'settings', 'api'].includes(id);
+        setTab(isTab ? id as Tab : 'world');
+        setEnterRoom(isTab ? null : id as VRRoomId);
+    });
     const [readerNovel, setReaderNovel] = useState<VRWorldNovel | null>(null);
     const [readerJump, setReaderJump] = useState<{ novel: VRWorldNovel; seg: number } | null>(null);
     const [showUpload, setShowUpload] = useState(false);
@@ -344,7 +357,7 @@ const VRWorldApp: React.FC = () => {
     }, [familiarity, sarHubPanel, tab, loading, enterRoom, sarPromptStep, showSarDialogue, showSarGacha, showSarCabinet, showSarModuleShop, showFishingMarket, showHelp, sarState, worldPage]);
 
     const loadNovels = useCallback(async () => {
-        const [books, categories] = await Promise.all([DB.getVRNovels(), DB.getVRLibraryCategories()]);
+        const [books, categories] = await Promise.all([DB.getVRNovelSummaries(), DB.getVRLibraryCategories()]);
         setNovels(books); setLibraryCategories(categories);
     }, []);
     const loadFeed = useCallback(async () => {
@@ -362,17 +375,17 @@ const VRWorldApp: React.FC = () => {
             const msgs = await DB.getVRCardsByCharId(c.id, 50, m => !m.metadata?.userBoardPost);
             if (generation !== feedLoadGeneration.current) return;
             if (!msgs.length) continue;
-            // 可见性与实际发送的自适应/手动范围保持一致。
-            const visibleIds = await loadCharacterContextMessageIds(c, msgs);
-            if (generation !== feedLoadGeneration.current) return;
             for (const m of msgs) {
                 // 用户在留言簿的发言会广播进每个角色的 vr_card（供 LLM 上下文用），
                 // 但它不是"角色自己的动态"——不进动态流，也不当作 chibi 气泡。
                 if (!m.metadata?.userBoardPost) {
-                    items.push({ msgId: m.id, charId: c.id, charName: c.name, avatar: c.avatar, timestamp: m.timestamp, meta: m.metadata as VRCardMeta, content: m.content, hidden: !visibleIds.has(m.id) });
+                    items.push({ msgId: m.id, charId: c.id, charName: c.name, avatar: c.avatar, timestamp: m.timestamp, meta: m.metadata as VRCardMeta, content: m.content });
                 }
             }
+            items.sort((a, b) => b.timestamp - a.timestamp);
+            items.length = Math.min(items.length, 50);
         }
+        if (generation !== feedLoadGeneration.current) return;
         items.sort((a, b) => b.timestamp - a.timestamp);
         setFeed(items.slice(0, 50));
     }, [characters]);
@@ -380,8 +393,10 @@ const VRWorldApp: React.FC = () => {
     const reloadAll = useCallback(async () => {
         // Background refresh must not unmount the library and reset its filter/selection.
         // Initial loading is already true until the first load finishes.
+        const generation = ++reloadGeneration.current;
         const results = await Promise.allSettled([loadNovels(), loadFeed()]);
-        setLoadError(results.some(result => result.status === 'rejected'));
+        if (generation !== reloadGeneration.current) return;
+        setLoadError(results.flatMap((result, index) => result.status === 'rejected' ? [index === 0 ? '书库' : '动态'] : []));
         setLoading(false);
     }, [loadNovels, loadFeed]);
 
@@ -423,6 +438,8 @@ const VRWorldApp: React.FC = () => {
 
     // 返回键：有弹层先关弹层（阅读器/房间/上传/捏人），而不是直接退回桌面
     useEffect(() => registerBackHandler(() => {
+        if (halloweenNpc) { setHalloweenNpc(null); return true; }
+        if (halloweenCharacter) { setHalloweenCharacter(null); return true; }
         if (closeSARFacilityGuide()) return true;
         if (showSarRewindConfirm) { setShowSarRewindConfirm(false); return true; }
         if (familiarity && chibiEditUser) { setChibiEditUser(false); return true; }
@@ -442,14 +459,26 @@ const VRWorldApp: React.FC = () => {
         if (enterRoom) { setEnterRoom(null); return true; }
         if (tab === 'sar') { setTab('world'); return true; }
         return false; // 无弹层 → 交回默认（关闭 App）
-    }), [registerBackHandler, tab, familiarity, sarHubPanel, showFishingMarket, showSarModuleShop, showSarCabinet, showSarGacha, showSarRewindConfirm, showSarDialogue, readingPreferenceCharId, chibiEditChar, chibiEditUser, showUpload, readerJump, readerNovel, enterRoom]);
+    }), [registerBackHandler, halloweenNpc, halloweenCharacter, tab, familiarity, sarHubPanel, showFishingMarket, showSarModuleShop, showSarCabinet, showSarGacha, showSarRewindConfirm, showSarDialogue, readingPreferenceCharId, chibiEditChar, chibiEditUser, showUpload, readerJump, readerNovel, enterRoom]);
 
     // 从动态/批注点回原文：peek 模式打开阅读器跳到该段，不动用户书签
+    const readerLoadGeneration = useRef(0);
+    useEffect(() => () => { readerLoadGeneration.current++; }, []);
+    const openNovel = useCallback(async (novelId: string, segIdx?: number) => {
+        const generation = ++readerLoadGeneration.current;
+        try {
+            const novel = await DB.getVRNovel(novelId);
+            if (generation !== readerLoadGeneration.current) return;
+            if (!novel) { addToast?.('这本书已不存在，请刷新书库', 'info'); return; }
+            if (segIdx === undefined) setReaderNovel(novel);
+            else setReaderJump({ novel, seg: segIdx });
+        } catch {
+            if (generation === readerLoadGeneration.current) addToast?.('书籍载入失败，请重试', 'error');
+        }
+    }, [addToast]);
     const jumpToAnnotation = useCallback((novelId: string | undefined, segIdx: number) => {
-        if (!novelId) return;
-        const n = novels.find(x => x.id === novelId);
-        if (n) setReaderJump({ novel: n, seg: segIdx });
-    }, [novels]);
+        if (novelId) void openNovel(novelId, segIdx);
+    }, [openNovel]);
 
     // 用户在留言簿发言：落墙 + 以小卡片广播给所有接入彼方的角色私聊
     const onUserBoardPost = useCallback(async (content: string, replyTo?: VRGuestbookMessage) => {
@@ -585,17 +614,18 @@ const VRWorldApp: React.FC = () => {
 
             {/* 滚动容器不同于浮动 dock：滚到底时最后一条内容贴 viewport bottom = 屏幕底，必须 + safe-bottom 让位 home 条，否则翻页按钮被压（即原 #158 报的问题）。 */}
             <div className="vr-world-scroll relative flex-1 overflow-y-auto vr-reader-scroll px-4 z-10" style={{ paddingTop: '1rem', paddingBottom: `calc(1rem + ${VR_SAFE_BOTTOM})` }}>
-                {loadError && <div role="alert" className="px-5 py-3 text-center text-xs text-white/70">
-                    部分本地数据读取失败，请重试。已有数据不会被清除。
+                {loading && <p role="status" className="px-5 py-2 text-center text-xs text-white/40">正在读取本地书库与动态，其他功能可先使用。</p>}
+                {loadError.length > 0 && <div role="alert" className="px-5 py-3 text-center text-xs text-white/70">
+                    {loadError.join('、')}读取未完成，请重试；持续失败时请关闭其他糯米机页面后重新打开。无需清理记忆或角色数据。
                     <button className="ml-3 underline" onClick={() => void reloadAll()}>重新载入</button>
                 </div>}
-                {loading ? (
+                {loading && tab === 'library' ? (
                     <div className="text-center text-white/40 text-[13px] tracking-[0.2em] py-12" style={{ fontFamily: `'Noto Serif SC',serif` }}>载入彼方…</div>
                 ) : tab === 'sar' ? (
                     <SARWorldPage occupants={occupantsByRoom.sar || []} npcEnabled={sarState.npcPreference === 'show'} caianMet={sarState.caianMet}
                         roomView={sarRoomView(sarState)} onToggleLabels={() => {const view=nextSARRoomView(sarRoomView(sarState));setSarState(patchSARClubState({roomView:view,labelsHidden:view==='text-hidden'}));}}
-                        onTalkToCaian={() => sarState.caianMet ? setFamiliarity({npc:'caian'}) : setShowSarDialogue(true)} onTalkToAiven={() => setFamiliarity({npc:'aiven'})}
-                        onSelectCharacter={char => { setSarModuleTargetCharId(char.id); setShowSarModuleShop(true); }}
+                        onTalkToCaian={() => halloween.active && !halloween.state.completed.includes('caian') ? setHalloweenNpc('caian') : sarState.caianMet ? setFamiliarity({npc:'caian'}) : setShowSarDialogue(true)} onTalkToAiven={() => halloween.active && !halloween.state.completed.includes('aiven') ? setHalloweenNpc('aiven') : setFamiliarity({npc:'aiven'})}
+                        onSelectCharacter={char => { if (halloween.active) { setHalloweenCharacter(char); return; } setSarModuleTargetCharId(char.id); setShowSarModuleShop(true); }}
                         onOpenGacha={() => setShowSarGacha(true)} onOpenCabinet={() => setShowSarCabinet(true)}
                         onOpenModuleShop={() => setShowSarModuleShop(true)} onOpenFishingMarket={setShowFishingMarket}
                         onOpenSarSettings={() => setSarHubPanel('settings')} onOpenSarWarehouse={() => setSarHubPanel('warehouse')}
@@ -606,7 +636,7 @@ const VRWorldApp: React.FC = () => {
                         onDeleteFeed={onDeleteFeed} onDeleteFeedMany={onDeleteFeedMany}
                         roomPage={worldPage} onRoomPageChange={setWorldPage}/>
                 ) : tab === 'library' ? (
-                    <LibraryView novels={novels} categories={libraryCategories} characters={characters} onOpen={setReaderNovel}
+                    <LibraryView novels={novels} categories={libraryCategories} characters={characters} onOpen={novel => { void openNovel(novel.id); }}
                         onEdit={async edit => { await DB.editVRLibrary(edit); await loadNovels(); }}
                         onPreference={char => setReadingPreferenceCharId(char.id)}
                         onAdd={categoryId => { setUploadCategoryId(categoryId); setShowUpload(true); trackEvent('打开小说上架弹窗'); }}
@@ -640,6 +670,8 @@ const VRWorldApp: React.FC = () => {
             {sarPromptStep && (
                 <SARUpdateModal step={sarPromptStep} onContinue={() => setSarPromptStep('preference')} onChoose={chooseSarNpcPreference} />
             )}
+            {halloweenNpc && sarState.npcPreference === 'show' && <HalloweenDialogue key={halloweenNpc} npc={halloweenNpc} userName={userName} onClose={() => setHalloweenNpc(null)}/>}
+            {halloweenCharacter && halloween.active && <div className="fixed inset-0 z-[550] flex items-end bg-black/50" role="presentation" onClick={() => setHalloweenCharacter(null)}><section role="dialog" aria-modal="true" aria-label={`${halloweenCharacter.name}的万圣节`} className="w-full rounded-t-2xl p-5 text-white bg-[#1a2236]" style={{ paddingBottom: vrBottomPad('1rem') }} onClick={e => e.stopPropagation()}><div className="flex items-center justify-between"><strong>{halloweenCharacter.name}</strong><button className="p-3" onClick={() => setHalloweenCharacter(null)} aria-label="关闭角色弹窗"><X size={20}/></button></div><HalloweenActions actorId={halloweenCharacter.id} name={halloweenCharacter.name}/><button className="mt-3 min-h-[44px] w-full" onClick={() => { setSarModuleTargetCharId(halloweenCharacter.id); setShowSarModuleShop(true); setHalloweenCharacter(null); }}>抓住 TA · 使用模块</button></section></div>}
             {showSarDialogue && sarState.npcPreference === 'show' && (
                 <SARCaianDialogue onClose={() => setShowSarDialogue(false)} onComplete={completeSarIntro} />
             )}
@@ -925,7 +957,7 @@ const Chibi: React.FC<{ char: CharacterProfile; bubble?: string; onTap?: () => v
             )}
             <div className="relative" style={{ animation: `${dance ? 'vrdance 0.9s' : 'vrfloat 3.2s'} ease-in-out infinite`, animationDelay: `${(char.id.charCodeAt(0) % 10) * 0.15}s` }}>
                 {c.img ? (
-                    <TokenImg value={c.img} alt={char.name}
+                    <HalloweenChibi actorId={char.id} img={c.img} name={char.name}
                         style={{ height: size * c.scale, transform: `scaleX(${c.flip ? -1 : 1}) translateY(${c.offsetY}px)`, filter: 'drop-shadow(0 4px 6px rgba(0,0,0,.5))' }}
                         className="object-contain" />
                 ) : (
@@ -1526,14 +1558,14 @@ const WorldView: React.FC<{
     );
 };
 
-// 单条动态卡片：非管理态长按删除；管理态点击多选。已隐藏（对 AI 不可见）的暗显并标「已隐藏」。
+// 单条动态卡片：非管理态长按删除；管理态点击多选。只展示数据库中仍存在的记录。
 const FeedCard: React.FC<{ item: FeedItem; onJump: (novelId: string | undefined, segIdx: number) => void; onRequestDelete: (item: FeedItem) => void; manageMode?: boolean; selected?: boolean; onToggleSelect?: (msgId: number) => void }> = ({ item, onJump, onRequestDelete, manageMode, selected, onToggleSelect }) => {
     const room = getRoom(item.meta.room);
     const { pressing, handlers } = useLongPress(() => onRequestDelete(item), 550);
     const cardHandlers = manageMode ? { onClick: () => onToggleSelect?.(item.msgId) } : handlers;
     return (
         <div {...cardHandlers}
-            className={`relative rounded-2xl p-3 flex gap-3 backdrop-blur-sm transition-transform ${pressing ? 'scale-[0.97]' : ''} ${manageMode ? 'cursor-pointer' : ''} ${item.hidden && !selected ? 'opacity-55' : ''}`}
+            className={`relative rounded-2xl p-3 flex gap-3 backdrop-blur-sm transition-transform ${pressing ? 'scale-[0.97]' : ''} ${manageMode ? 'cursor-pointer' : ''}`}
             style={{ background: selected ? 'rgba(99,102,241,0.20)' : pressing ? 'rgba(244,63,94,0.14)' : 'rgba(255,255,255,0.05)', border: `1px solid ${selected ? 'rgba(129,140,248,0.6)' : pressing ? 'rgba(244,63,94,0.4)' : 'rgba(255,255,255,0.07)'}`, boxShadow: '0 4px 18px rgba(0,0,0,.22)' }}>
             {manageMode && (
                 <div className="self-center shrink-0 h-5 w-5 rounded-full flex items-center justify-center" style={{ border: `1.5px solid ${selected ? '#818cf8' : 'rgba(255,255,255,.35)'}`, background: selected ? '#6366f1' : 'transparent' }}>
@@ -1545,7 +1577,6 @@ const FeedCard: React.FC<{ item: FeedItem; onJump: (novelId: string | undefined,
                 <div className="flex items-center gap-1.5 text-[11px]">
                     <span className="font-bold text-amber-200">{item.charName}</span>
                     <span className="text-indigo-300/50">{room.name}</span>
-                    {item.hidden && <span className="text-[8px] text-white/55 rounded-full px-1.5 py-[1px] leading-none shrink-0" style={{ border: '1px solid rgba(255,255,255,.2)', background: 'rgba(0,0,0,.28)' }}>已隐藏</span>}
                     <span className="ml-auto text-indigo-300/40 text-[9px] shrink-0">{new Date(item.timestamp).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
                 <p className="text-[11.5px] text-indigo-50/90 mt-0.5 leading-snug">{stripSelfName(item.meta.activity, item.charName)}</p>
@@ -2345,22 +2376,30 @@ const SignalPanel: React.FC<{ addToast?: (m: string, t?: any) => void; character
         addToast?.(whisper.trim() ? `${c.name} 带着你的话，正在信号坠落处落笔…` : `${c.name} 正在信号坠落处落笔…`, 'info');
     };
 
+    const stateRead = useRef(0);
+    const feedRead = useRef(0);
     const load = useCallback(async () => {
-        try { setState(await Signal.current()); setOffline(false); }
-        catch { setOffline(true); }
-        finally { setLoading(false); }
+        const read = ++stateRead.current;
+        try { const next = await Signal.current(); if (read === stateRead.current) { setState(next); setOffline(false); } }
+        catch { if (read === stateRead.current) setOffline(true); }
+        finally { if (read === stateRead.current) setLoading(false); }
     }, []);
     // 星图始终拉全量：分幕要按「每首在册子里的顺位」归幕，取子集会算错顺位；
     // 「只看我的回声」改为客户端过滤（mineCount 已随本机 device 标注，结果等价）。
     const loadFeed = useCallback(async () => {
-        try { setFeed(await Signal.feed(60)); } catch { /* 离线不影响 */ }
+        const read = ++feedRead.current;
+        try { const next = await Signal.feed(60); if (read === feedRead.current) setFeed(next); } catch { /* 离线不影响 */ }
     }, []);
 
     useEffect(() => {
         void load(); void loadFeed();
         const h = () => { void load(); void loadFeed(); };
         window.addEventListener('vr-session-done', h);
-        return () => window.removeEventListener('vr-session-done', h);
+        window.addEventListener(SIGNAL_OWNERSHIP_RECOVERED, h);
+        return () => {
+            window.removeEventListener('vr-session-done', h);
+            window.removeEventListener(SIGNAL_OWNERSHIP_RECOVERED, h);
+        };
     }, [load, loadFeed]);
 
     // 参与被打回（调 LLM 之前，零 token）→ 温柔提示
@@ -2999,6 +3038,7 @@ const RoomScene: React.FC<{
                 {isSignal && <SignalPanel addToast={addToast} characters={characters} />}
 
                 {/* chibi 站位（可隐藏，避免挡住留言墙等文字） */}
+                <HalloweenPumpkins/>
                 {!hideChibi && occupants.map((c, i) => {
                     const slot = slots[i % slots.length];
                     const latest = latestByChar[c.id];
@@ -3074,6 +3114,7 @@ const RoomScene: React.FC<{
                         })() : (
                             <p className="text-[12px] text-indigo-300/60">还没有留下动态，等 ta 下一次登入吧。</p>
                         )}
+                        <HalloweenActions actorId={detail.id} name={detail.name}/>
                         {detail.id !== 'user' && (
                             <>
                                 {detail.vrState?.sarModule && (
@@ -3496,13 +3537,13 @@ const UploadModal: React.FC<{
                             <div className="flex items-center gap-1.5 mt-2">
                                 <span className="text-[9.5px] text-indigo-300/55 shrink-0">乱码？换编码</span>
                                 <select value={chosenEncoding} onChange={e => redecode(e.target.value)}
-                                    className="flex-1 text-[10px] bg-[#1b2236] text-indigo-100 border border-indigo-300/25 rounded px-1.5 py-1 outline-none">
-                                    <option value="auto">自动识别</option>
-                                    <option value="utf-8">UTF-8</option>
-                                    <option value="gb18030">简体中文 · GB18030 / GBK</option>
-                                    <option value="big5">繁体中文 · Big5</option>
-                                    <option value="shift_jis">日文 · Shift_JIS</option>
-                                    <option value="euc-jp">日文 · EUC-JP</option>
+                                    className="flex-1 text-[10px] bg-[#1b2236] text-indigo-100 [color-scheme:dark] border border-indigo-300/25 rounded px-1.5 py-1 outline-none">
+                                    <option value="auto" className="bg-[#1b2236] text-indigo-100">自动识别</option>
+                                    <option value="utf-8" className="bg-[#1b2236] text-indigo-100">UTF-8</option>
+                                    <option value="gb18030" className="bg-[#1b2236] text-indigo-100">简体中文 · GB18030 / GBK</option>
+                                    <option value="big5" className="bg-[#1b2236] text-indigo-100">繁体中文 · Big5</option>
+                                    <option value="shift_jis" className="bg-[#1b2236] text-indigo-100">日文 · Shift_JIS</option>
+                                    <option value="euc-jp" className="bg-[#1b2236] text-indigo-100">日文 · EUC-JP</option>
                                 </select>
                             </div>
                         )}
@@ -3565,7 +3606,7 @@ const ChibiEditor: React.FC<{
 
     const isSully = (char.name || '').toLowerCase().includes('sully');
     // 回填：捏人器 init 读 presets（扁平 map），用上次导出的 state.selected
-    const presets = existing?.state?.selected || (isSully ? { skin: 'skin_1', fronthair: 'fronthair_99', eyes: 'eyes_99' } : undefined);
+    const presets = existing?.state?.selected || (isSully ? sullyPresets() : undefined);
 
     const onConfirm = (r: ChibiResult) => {
         setImg(r.transparentDataUrl);
@@ -3808,7 +3849,7 @@ const SettingsView: React.FC<{
     characters: CharacterProfile[];
     updateCharacter: ReturnType<typeof useOS>['updateCharacter'];
     addToast?: (msg: string, type?: any) => void;
-    novels: VRWorldNovel[]; onReload: () => void;
+    novels: VRWorldNovelSummary[]; onReload: () => void;
     onRequestEnable: (char: CharacterProfile) => void;
     onEditChibi: (char: CharacterProfile) => void;
     onEditReadingPreference: (char: CharacterProfile) => void;
@@ -3984,7 +4025,7 @@ const VRApiSettings: React.FC<{ apiPresets: ApiPreset[]; chatApi: APIConfig; add
 
     const choose = (cfg: APIConfig | null) => {
         void setVRApi(cfg); setVr(cfg); setTestResult(null);
-        addToast?.(cfg ? '已切换彼方 API' : '彼方改为跟随聊天默认', 'success');
+        addToast?.(cfg ? '已切换彼方 API' : '彼方改为角色回复跟随角色 API，未设置则跟随全局', 'success');
     };
 
     const test = async () => {
@@ -3996,7 +4037,8 @@ const VRApiSettings: React.FC<{ apiPresets: ApiPreset[]; chatApi: APIConfig; add
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.apiKey || 'sk-none'}` },
                 body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: 'Hi' }], max_tokens: 5, stream: false }),
-            });
+                __sullyMeta: { appId: 'vrworld', appName: '彼方', purpose: '测试连接' },
+            } as RequestInit);
             if (res.ok) { const d = await safeResponseJson(res); const r = d.choices?.[0]?.message?.content || ''; setTestResult(`连接成功 — 模型回复:"${r.slice(0, 24)}"`); }
             else { const t = await res.text().catch(() => ''); setTestResult(`HTTP ${res.status}: ${t.slice(0, 80)}`); }
         } catch (e: any) { setTestResult(`连接失败: ${e.message}`); } finally { setTesting(false); }
@@ -4029,17 +4071,17 @@ const VRApiSettings: React.FC<{ apiPresets: ApiPreset[]; chatApi: APIConfig; add
     return (
         <div className="space-y-3">
             <p className="text-[11px] text-indigo-300/60 leading-relaxed">
-                彼方里的角色会自主、按间隔登入触发模型调用，比较费 API。你可以在这里给彼方<b className="text-indigo-200">单独指定一份 API</b>（和「设置」里保存的预设共用同一批），不设则跟随聊天默认。
+                彼方里的角色会自主、按间隔登入触发模型调用，比较费 API。你可以在这里给彼方<b className="text-indigo-200">单独指定一份 API</b>（和「设置」里保存的预设共用同一批），不设则角色回复跟随角色 API，未设置则跟随全局。
             </p>
 
             {/* 当前生效 */}
             <div className="rounded-2xl p-3.5" style={{ background: 'rgba(255,255,255,0.045)', border: '1px solid rgba(255,255,255,0.08)' }}>
                 <div className="text-[10px] tracking-[0.2em] text-indigo-200/60 mb-1.5" style={{ fontFamily: `'Noto Serif SC',serif` }}>当前生效</div>
-                <div className="text-[12.5px] text-white/90 font-semibold">{effective?.model || '未配置'}</div>
-                <div className="text-[10px] text-white/40 mt-0.5">{host(effective?.baseUrl)} · {follow ? '跟随聊天默认' : '彼方独立'}</div>
+                <div className="text-[12.5px] text-white/90 font-semibold">{follow ? '按角色使用模型' : effective?.model || '未配置'}</div>
+                <div className="text-[10px] text-white/40 mt-0.5">{follow ? `全局备用：${chatApi.model || '未配置'} · ${host(chatApi.baseUrl)}` : `${host(effective?.baseUrl)} · 彼方独立`}</div>
                 <button onClick={test} disabled={testing} className="mt-2.5 text-[11px] px-3 py-1.5 rounded-full font-semibold disabled:opacity-50"
                     style={{ background: 'rgba(120,180,255,.16)', color: '#bcd4ff', border: '1px solid rgba(140,180,255,.3)' }}>
-                    {testing ? '测试中…' : '测试连接'}
+                    {testing ? '测试中…' : follow ? '测试全局备用 API' : '测试连接'}
                 </button>
                 {testResult && <div className={`mt-2 text-[10.5px] px-2.5 py-1.5 rounded-lg leading-snug ${testResult.startsWith('连接成功') ? 'text-emerald-300' : 'text-rose-300'}`} style={{ background: 'rgba(0,0,0,.25)' }}>{testResult}</div>}
             </div>
@@ -4051,7 +4093,7 @@ const VRApiSettings: React.FC<{ apiPresets: ApiPreset[]; chatApi: APIConfig; add
                     className="w-full flex items-center gap-2 rounded-xl p-3 mb-1.5 text-left active:scale-[0.99] transition-transform"
                     style={{ background: follow ? 'rgba(120,180,255,.12)' : 'rgba(255,255,255,.04)', border: `1px solid ${follow ? 'rgba(140,180,255,.4)' : 'rgba(255,255,255,.07)'}` }}>
                     <div className="flex-1 min-w-0">
-                        <div className="text-[12px] text-white/90 font-semibold">跟随聊天默认</div>
+                        <div className="text-[12px] text-white/90 font-semibold">跟随角色设置</div>
                         <div className="text-[10px] text-white/40 truncate">{chatApi?.model || '未配置'} · {host(chatApi?.baseUrl)}</div>
                     </div>
                     {follow && <span className="text-[10px] text-sky-300 font-bold shrink-0">✓ 使用中</span>}
@@ -4166,4 +4208,6 @@ const VRStyleTag: React.FC = () => (
     `}</style>
 );
 
-export default VRWorldApp;
+export default function KanataApp() { return <KanataHalloweenProvider><VRWorldApp/></KanataHalloweenProvider>; }
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

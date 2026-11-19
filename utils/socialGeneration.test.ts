@@ -15,11 +15,11 @@ const social = { name: '雨的账号', bio: '画画日记', avatar: '' };
 const resolve = (item: any, participants = [a, b]) => resolveSparkAuthor(item, participants, chars, handles, [user.name, social.name]);
 
 describe('Spark persona and conversation context', () => {
-    it('includes scoped personas, user identity mapping and only each participant’s recent messages', () => {
-        const context = buildSparkGenerationContext([a, b], user, social, handles, {
+    it('includes scoped personas, user identity mapping and only each participant’s recent messages', async () => {
+        const context = (await buildSparkGenerationContext([a, b], user, social, handles, {
             'a-id': [{ role: 'user', content: '明天去看花展' } as Message],
             'c-id': [{ role: 'user', content: '第三人的秘密' } as Message],
-        });
+        }));
         for (const text of [a.systemPrompt, b.systemPrompt, user.name, user.bio, social.name, '明天去看花展', 'a-id', 'b-id', '小花园', 'SullyDev']) {
             expect(context).toContain(text);
         }
@@ -42,8 +42,8 @@ describe('Spark persona and conversation context', () => {
         expect(history).toContain('对，就是那次');
     });
 
-    it('supports characters without saved Spark handles', () => {
-        expect(buildSparkGenerationContext([c], user, social, {}).includes('阿白')).toBe(true);
+    it('supports characters without saved Spark handles', async () => {
+        expect((await buildSparkGenerationContext([c], user, social, {})).includes('阿白')).toBe(true);
         expect(resolve({ author: '阿白', charId: 'c-id' }, [c])?.character).toBe(c);
     });
 });
@@ -67,5 +67,14 @@ describe('Spark author attribution', () => {
         const duplicate = { ...handles, 'b-id': [{ id: 'b', handle: '小花园', note: '' }] };
         expect(resolveSparkAuthor({ author: '小花园' }, [a, b], chars, duplicate, [])).toBeNull();
         expect(resolveSparkAuthor({ author: '小花园', charId: 'b-id' }, [a, b], chars, duplicate, [])?.character).toBe(b);
+    });
+
+    it('does not reuse recall left on the shared character object', async () => {
+        const stale = { ...a, memoryPalaceEnabled: true, memoryPalaceInjection: 'STALE_RECALL', roomPlatesInjection: 'STALE_PLATES' } as CharacterProfile;
+        const context = await buildSparkGenerationContext([stale], user, social, handles);
+        expect(context).not.toContain('STALE_RECALL');
+        expect(context).not.toContain('STALE_PLATES');
+        // 本次召回只写在副本上，调用方传进来的角色对象保持原样
+        expect(stale.memoryPalaceInjection).toBe('STALE_RECALL');
     });
 });

@@ -21,6 +21,7 @@ import {
 import { formatFeishuWriteFailure } from './feishuDiagnostics';
 import {
     fetchWeatherWithFallback,
+    normalizeFreeWeatherSource,
     generateWeatherAdvice as generateWeatherAdviceCore,
     checkSpecialDates as checkSpecialDatesCore,
     clearGeocodeCache,
@@ -55,7 +56,9 @@ export interface RealtimeConfig {
     userHolidays?: UserHolidayConfig;
     // 天气配置
     weatherEnabled: boolean;
-    weatherApiKey: string;  // OpenWeatherMap API Key（可选；留空走免 key 的 Open-Meteo）
+    weatherApiKey: string;  // OpenWeatherMap API Key（可选；留空走所选免费源）
+    weatherFreeSource?: import('./weatherSources').FreeWeatherSource;
+    weatherCities?: Record<string, string>; // Per-character override; missing/blank inherits weatherCity.
     weatherCity: string;    // 城市名 (如 "北京"、"Beijing"，Open-Meteo 支持中文)
 
     // 新闻配置
@@ -98,6 +101,8 @@ export interface RealtimeConfig {
 export const defaultRealtimeConfig: RealtimeConfig = {
     weatherEnabled: false,
     weatherApiKey: '',
+    weatherFreeSource: 'wttr',
+    weatherFreeSourceMigration: 1,
     weatherCity: 'Beijing',
     newsEnabled: false,
     newsApiKey: '',
@@ -121,14 +126,14 @@ export const defaultRealtimeConfig: RealtimeConfig = {
 };
 
 // 缓存
-let weatherCache: { data: WeatherData | null; timestamp: number } = { data: null, timestamp: 0 };
+const weatherCache = new Map<string, {data: WeatherData; timestamp: number}>();
 let newsCache: { data: NewsItem[]; timestamp: number } = { data: [], timestamp: 0 };
 
 
 export const RealtimeContextManager = {
 
     /**
-     * 获取天气信息。填了 OpenWeatherMap key 优先走 OWM，失败或没填 key 时回落免费的 Open-Meteo。
+     * 获取天气信息。OWM（有 key 时）→ 所选免费源 → 另一免费源，缓存按城市、Key 与首选源隔离。
      */
     fetchWeather: async (config: RealtimeConfig): Promise<WeatherData | null> => {
         if (!config.weatherEnabled || !config.weatherCity) {
@@ -139,17 +144,20 @@ export const RealtimeContextManager = {
         const cacheMs = config.cacheMinutes * 60 * 1000;
 
         // 检查缓存
-        if (weatherCache.data && (now - weatherCache.timestamp) < cacheMs) {
-            return weatherCache.data;
+        const key = JSON.stringify([config.weatherCity.trim(), config.weatherApiKey?.trim(), normalizeFreeWeatherSource(config.weatherFreeSource)]);
+        const cached = weatherCache.get(key);
+        if (cached && (now - cached.timestamp) < cacheMs) {
+            return cached.data;
         }
 
-        const weather = await fetchWeatherWithFallback(config.weatherCity, config.weatherApiKey);
+        const weather = await fetchWeatherWithFallback(config.weatherCity, config.weatherApiKey, config.weatherFreeSource);
         if (!weather) {
             return null;
         }
 
         // 更新缓存
-        weatherCache = { data: weather, timestamp: now };
+        if (weatherCache.size >= 100) weatherCache.delete(weatherCache.keys().next().value!);
+        weatherCache.set(key, { data: weather, timestamp: now });
 
         return weather;
     },
@@ -253,12 +261,12 @@ export const RealtimeContextManager = {
                 headers: {
                     'Accept': 'application/json',
                     'X-Brave-API-Key': apiKey  // Worker 需要这个 header
-                }
-            });
+                }, __sullyHandlesFailure: true
+            } as RequestInit);
 
             if (!response.ok) {
                 const errorText = await response.text();
-                console.error('Brave API error:', response.status, errorText);
+                console.warn('Brave API error:', response.status, errorText);
                 return [];
             }
 
@@ -274,7 +282,7 @@ export const RealtimeContextManager = {
             }
             return [];
         } catch (e) {
-            console.error('Brave Search failed:', e);
+            console.warn('Brave Search failed:', e);
             return [];
         }
     },
@@ -319,6 +327,7 @@ export const RealtimeContextManager = {
             console.log(`%c[hot_news] 本次新闻源 = Hacker News 兜底（${news.length} 条，英文）`, 'color:#dc2626;font-weight:bold');
             newsCache = { data: news, timestamp: now };
         }
+        if (!news.length) console.error('[hot_news] 所有新闻源均未返回内容');
         return news;
     },
 
@@ -327,7 +336,7 @@ export const RealtimeContextManager = {
      */
     fetchBackupNews: async (): Promise<NewsItem[]> => {
         try {
-            const response = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json');
+            const response = await fetch('https://hacker-news.firebaseio.com/v0/topstories.json', { __sullyHandlesFailure: true } as RequestInit);
             if (!response.ok) return [];
 
             const ids = await safeResponseJson(response);
@@ -335,7 +344,7 @@ export const RealtimeContextManager = {
 
             const stories = await Promise.all(
                 topIds.map(async (id: number) => {
-                    const storyRes = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
+                    const storyRes = await fetch(`https://hacker-news.firebaseio.com/v0/item/${id}.json`, { __sullyHandlesFailure: true } as RequestInit);
                     return safeResponseJson(storyRes);
                 })
             );
@@ -420,7 +429,7 @@ export const RealtimeContextManager = {
         tz: string | undefined,
         // includeTime=false：角色关掉了「时间感知」。天气/新闻还要，但当前时间和今日节日
         // 属于时间感知的范畴，这个开关关着就不该从这一段里漏出去。
-        opts: { includeTime: boolean },
+        opts: { includeTime: boolean; userLocation?: Promise<string> },
     ): Promise<string> => {
         const includeTime = opts.includeTime;
 
@@ -439,7 +448,7 @@ export const RealtimeContextManager = {
         const newsPool = config.newsEnabled ? await RealtimeContextManager.fetchNews(config) : [];
         const picks = pickRandomNews(newsPool, REALTIME_NEWS_PICK_COUNT);
 
-        const fullContext = renderRealtimeWorldBlock({ timeLine, specialDates, weather, news: picks });
+        const fullContext = renderRealtimeWorldBlock({ timeLine, specialDates, weather, news: picks, userLocationText: await opts.userLocation });
 
         // ── F12 探针：本轮真正注入 prompt 的热点 + 文本量（评估 token 用）──
         try {
@@ -467,7 +476,7 @@ export const RealtimeContextManager = {
      * 清除缓存
      */
     clearCache: () => {
-        weatherCache = { data: null, timestamp: 0 };
+        weatherCache.clear();
         newsCache = { data: [], timestamp: 0 };
         clearGeocodeCache();
     },
@@ -1621,6 +1630,9 @@ export interface XhsNote {
     author: string;
     authorId: string;
     xsecToken?: string;
+    xsecSource?: string;
+    url?: string;
+    platform?: 'xhs' | 'rednote';
     coverUrl?: string;
     type?: string;  // 'normal' | 'video'
     comments?: {

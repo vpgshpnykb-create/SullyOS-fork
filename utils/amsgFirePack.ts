@@ -126,9 +126,81 @@ export const parseChatFailRecord = (value: string | null | undefined): AmsgChatF
  */
 const GZIP_VALUE_PREFIX = 'gz1:';
 
-/** 运行时有没有压缩能力（老 Safari 没有 CompressionStream）。 */
-const canCompress = (): boolean =>
-  typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
+/**
+ * 合法单成员 gzip 帧的最小长度：10 字节头 + 至少 2 字节 DEFLATE 结束块 + 8 字节尾部（CRC32 + ISIZE）。
+ * 原文字节数不超过这一行加上前缀与 base64 膨胀（gz1: + 28 字符 = 32 字节）时，压完绝不可能比原文短。
+ */
+const GZIP_MIN_FRAME_BYTES = 20;
+const MIN_WORTH_PACKING_BYTES = 32;
+
+export type GzipFallbackCompressor = (
+  rawBytes: Uint8Array,
+) => Promise<Uint8Array | null> | Uint8Array | null;
+
+// 记录已确认异常的原生 CompressionStream 构造器引用：生产环境里页面生命周期内构造器恒定，
+// 一旦触发熔断本页后续不再调它；单测替换并还原 globalThis.CompressionStream 时自动恢复隔离。
+let brokenCompressionStreamCtor: unknown = null;
+let gzipFallbackCompressor: GzipFallbackCompressor | null = null;
+
+/**
+ * 注册前端按需纯 JS gzip 压缩器（如懒加载 fflate）。
+ * 本模块被 Worker bundle 直接引用，保持零外部依赖；纯 JS 兜底由前端入口注入。
+ * 返回先前的处理器便于单测临时替换后还原。
+ */
+export const registerGzipFallbackCompressor = (
+  compressor: GzipFallbackCompressor | null,
+): GzipFallbackCompressor | null => {
+  const prev = gzipFallbackCompressor;
+  gzipFallbackCompressor = compressor;
+  return prev;
+};
+
+/** 单测重置压缩熔断状态用。 */
+export const resetGzipCompressionStateForTests = (): void => {
+  brokenCompressionStreamCtor = null;
+};
+
+let crc32Table: Uint32Array | null = null;
+
+const getCrc32Table = (): Uint32Array => {
+  if (crc32Table) return crc32Table;
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c >>> 0;
+  }
+  crc32Table = table;
+  return table;
+};
+
+const computeCrc32 = (bytes: Uint8Array): number => {
+  const table = getCrc32Table();
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+};
+
+/**
+ * 核对压缩产物是否为对应输入字节的完整 gzip 帧（RFC 1952）。
+ *
+ * 部分移动端 WebKit 的 CompressionStream 在压缩较大缓冲或切后台时不会抛异常，而是静默返回
+ * 未刷完尾部的半截字节流；单看是否抛错或字节变短无法识别，读侧解压会报 incomplete data。
+ * 核对魔数与末尾 8 字节（CRC32 + 原始长度 ISIZE）可在微秒~亚毫秒级拦截截断产物，且不依赖
+ * 同一内核的 DecompressionStream。
+ */
+export const isValidGzipForInput = (rawBytes: Uint8Array, gz: Uint8Array): boolean => {
+  if (gz.byteLength < GZIP_MIN_FRAME_BYTES) return false;
+  if (gz[0] !== 0x1f || gz[1] !== 0x8b || gz[2] !== 0x08) return false;
+  const view = new DataView(gz.buffer, gz.byteOffset, gz.byteLength);
+  const expectedSize = rawBytes.byteLength >>> 0;
+  if (view.getUint32(gz.byteLength - 4, true) !== expectedSize) return false;
+  return view.getUint32(gz.byteLength - 8, true) === computeCrc32(rawBytes);
+};
 
 // btoa/atob 只吃 latin1 字符串，二进制要一个字节一个字符地喂。整段 apply 展开会在大数据上
 // 爆调用栈，按块拼。
@@ -149,20 +221,69 @@ const base64ToBytes = (base64: string): Uint8Array => {
   return bytes;
 };
 
-const streamThrough = async (data: Uint8Array, transform: TransformStream): Promise<Uint8Array> => {
-  const stream = new Blob([data as BlobPart]).stream().pipeThrough(transform);
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+// 直接向 TransformStream.writable 写入，不经过 Blob.stream()（规避 Safari 读取临时 Blob 流时的
+// I/O 异常）；同时传入独立切片，避免部分流实现转移底层 ArrayBuffer 影响后续长度/CRC32 核对与兜底压缩。
+const streamThrough = async (
+  data: Uint8Array,
+  transform: { readable: ReadableStream<Uint8Array>; writable: WritableStream<BufferSource> },
+): Promise<Uint8Array> => {
+  const readablePromise = new Response(transform.readable).arrayBuffer();
+  const writer = transform.writable.getWriter();
+  const writePromise = writer.write(data.slice())
+    .then(() => writer.close())
+    .catch(async (error) => {
+      try { await writer.abort(error); } catch { /* ignore */ }
+      throw error;
+    });
+  const [buffer] = await Promise.all([readablePromise, writePromise]);
+  return new Uint8Array(buffer);
 };
 
 /**
- * 上传前把值压掉。压不动或运行时不支持时原样返回 —— 这个函数永远不该让同步失败，
+ * 将字节压成经完整性核对的 gzip：优先走健康的原生 CompressionStream；原生缺失、抛错或
+ * 输出截断时熔断本页原生压缩并切换已注册的纯 JS 压缩器；两边都不可用时返回 null 由调用方退回明文。
+ */
+export const compressGzipBytes = async (rawBytes: Uint8Array): Promise<Uint8Array | null> => {
+  if (typeof CompressionStream === 'function' && CompressionStream !== brokenCompressionStreamCtor) {
+    const ctor = CompressionStream;
+    try {
+      const gz = await streamThrough(rawBytes, new CompressionStream('gzip'));
+      if (isValidGzipForInput(rawBytes, gz)) {
+        return gz;
+      }
+      brokenCompressionStreamCtor = ctor;
+      console.warn('[AmsgGzip] 原生 CompressionStream 输出的 gzip 头尾不完整，切换备用压缩通道');
+    } catch (error) {
+      brokenCompressionStreamCtor = ctor;
+      console.warn('[AmsgGzip] 原生 CompressionStream 压缩失败，切换备用压缩通道', error);
+    }
+  }
+  if (gzipFallbackCompressor) {
+    try {
+      const fallbackGz = await gzipFallbackCompressor(rawBytes);
+      if (fallbackGz && isValidGzipForInput(rawBytes, fallbackGz)) {
+        return fallbackGz;
+      }
+    } catch {
+      // 备用压缩也不可用（例如离线且懒加载分包尚未缓存）时回退明文。
+    }
+  }
+  return null;
+};
+
+/**
+ * 上传前把值压掉。压不动或压缩通道均不可用时原样返回 —— 这个函数永远不该让同步失败，
  * 云端那份 fire_pack 是角色到点时唯一的上下文来源，为了省流量把它弄丢是本末倒置。
  */
 export const packStateValue = async (json: string): Promise<string> => {
-  if (!canCompress()) return json;
+  const nativeAvailable =
+    typeof CompressionStream === 'function' && CompressionStream !== brokenCompressionStreamCtor;
+  if (!nativeAvailable && !gzipFallbackCompressor) return json;
   try {
     const rawBytes = new TextEncoder().encode(json);
-    const gz = await streamThrough(rawBytes, new CompressionStream('gzip'));
+    if (rawBytes.byteLength <= MIN_WORTH_PACKING_BYTES) return json;
+    const gz = await compressGzipBytes(rawBytes);
+    if (!gz) return json;
     const packed = `${GZIP_VALUE_PREFIX}${bytesToBase64(gz)}`;
     // 划算不划算按**字节**比，不能用 .length。fire_pack 几乎全是中文，一个字符占 3 个
     // UTF-8 字节，而压完的 base64 全是 ASCII（1 字符 = 1 字节）——拿字符数比的话，
@@ -185,10 +306,10 @@ export const unpackStateValue = async (value: string): Promise<string> => {
 };
 
 /**
- * 防穿帮闸最近一次拦下了哪次触发（每角色一份，新的盖旧的）。
+ * 最近一次到点没发的是哪次触发（每角色一份，新的盖旧的）。
  *
- * 闸是完全静默工作的：worker 判定「该让路」之后直接跳过这次 fire，一条 push 都不发。
- * 对用户来说，「让路了」和「发出去但没收到」「功能坏了」长得一模一样——远端那行任务
+ * 没发是静默的：worker 这次不发就直接收场，一条 push 都不出。
+ * 对用户来说，「这次没发」和「发出去但没收到」「功能坏了」长得一模一样——远端那行任务
  * 两种情况下都会被消费掉，客户端事后无从分辨。
  *
  * 所以让 worker 在跳过时留一句话，客户端读回来照实说明。只留最近一次：这是给人看的
@@ -197,9 +318,8 @@ export const unpackStateValue = async (value: string): Promise<string> => {
 export const AMSG_LAST_SKIP_KEY = 'last_skip';
 
 /** last_skip 的原因枚举（新增值时 describeLastSkip 的人话文案要一起补）。 */
-const LAST_SKIP_REASONS = [
-  'active-chat-presence',
-  'conversation-moved-on',
+export const LAST_SKIP_REASONS = [
+  'declined',
   'empty-generation',
   'side-effects-only',
   'stale',
@@ -208,6 +328,8 @@ const LAST_SKIP_REASONS = [
   'min-gap',
   'recurring-unanswered',
   'daily-limit',
+  'chat-overlap',
+  'in-person',
 ] as const;
 
 export interface AmsgLastSkip {
@@ -217,8 +339,7 @@ export interface AmsgLastSkip {
   /** 本该触发的时刻。 */
   occurrenceMs: number;
   /**
-   * active-chat-presence  到点时用户正跟这个角色聊天
-   * conversation-moved-on 排程之后对话已经往前走了，原本要说的话过时了
+   * declined              角色到点看了最新的对话，自己决定这次不说（输出了 AMSG_SILENT_MARK）
    * empty-generation      模型这次没写出任何能发的正文（空输出 / 纯拒答）
    * side-effects-only     模型这次只做了副作用（点赞、写日记之类）却没说话，整条不发
    * stale                 到点时已经过期太久（服务停摆后恢复），不再补发
@@ -227,6 +348,8 @@ export interface AmsgLastSkip {
    * min-gap               角色自排的任务到点时，离它上一条主动消息还没隔够用户设的间隔
    * recurring-unanswered  重复的任务到点时，用户已经连续几次没回它了（回话后恢复）
    * daily-limit           今天主动发的次数已到用户设的每日上限
+   * chat-overlap          写到一半用户开口聊上了，这句没看到新对话，推送前拦下
+   * in-person             到点时用户正在和这个角色见面，人就在面前，不发手机消息
    */
   reason: (typeof LAST_SKIP_REASONS)[number];
   skippedAt: number;
@@ -260,10 +383,8 @@ export const parseLastSkip = (value: string): AmsgLastSkip | null => {
 export const describeLastSkip = (skip: AmsgLastSkip, formatTime: (ms: number) => string): string => {
   const when = formatTime(skip.occurrenceMs);
   switch (skip.reason) {
-    case 'active-chat-presence':
-      return `${when} 那次主动消息让路了——到点时你正在和 ta 聊天。`;
-    case 'conversation-moved-on':
-      return `${when} 那次主动消息取消了——排程之后你们的对话已经聊到别处，原本要说的话过时了。`;
+    case 'declined':
+      return `${when} 那次主动消息没发——ta 到点看了看你们的对话，觉得这会儿不用再说了。`;
     case 'empty-generation':
       return `${when} 那次主动消息没发出来——ta 到点想了想，这次没写出要说的话。`;
     case 'side-effects-only':
@@ -295,6 +416,10 @@ export const describeLastSkip = (skip: AmsgLastSkip, formatTime: (ms: number) =>
       return `${when} 那条重复消息这次没发——你已经连续几次没回它了，先停一停；你回一句话，它就照常恢复。`;
     case 'daily-limit':
       return `${when} 那次主动消息没发——今天 ta 主动找你的次数已经到了你设的每日上限，跳过的这次不会补发，明天重新计数。`;
+    case 'chat-overlap':
+      return `${when} 那次主动消息没发——ta 写好的时候你们正好聊上了，那句话没看到你刚说的，就没发出去。`;
+    case 'in-person':
+      return `${when} 那次主动消息没发——当时你们正在见面，人就在面前，就没再发消息；这次不会补发。`;
   }
 };
 
@@ -346,6 +471,47 @@ export const AMSG_SLOT_SCENE = '{{AMSG_SCENE}}';
  * 两处都出的话一份 prompt 里就有了两个钟。
  */
 export const AMSG_SLOT_REALTIME_WORLD = '{{AMSG_REALTIME_WORLD}}';
+/**
+ * 「你们此刻正聊着」的落点，在【开口之前】那一段里。
+ *
+ * 到点时对方是不是刚说过话，只有 worker 在触发那一刻知道。正聊着时这里填一行事实，
+ * 角色据此把要说的话顺着眼下的话头说、或者判断这会儿不该插进来；没在聊就填空串，
+ * 这一行连带消失。
+ */
+export const AMSG_SLOT_LIVE_CHAT = '{{AMSG_LIVE_CHAT}}';
+
+/**
+ * 角色决定这次不说时输出的标记（整段输出只有它）。
+ *
+ * 用一个明确的标记而不是「什么都不输出」：空输出还可能是中转站截断、模型拒答、正文全在
+ * 思考块里，这些都该算「没写出来」；有了标记，「看了对话决定不说」才能单独记一笔。
+ */
+export const AMSG_SILENT_MARK = '[[SILENT]]';
+
+/**
+ * 模板里【开口之前】那一段：到点说不说由角色自己判。
+ *
+ * 它看得到完整的最新对话，代码看不到语义。worker 到点只补一行事实
+ * （AMSG_SLOT_LIVE_CHAT：对方是不是刚说过话），没在聊时那一行连带消失。
+ * 默认是说。判据写成两件能对照上下文查证的事——这件事发生过没有、插进来会不会打断——
+ * 并且点名「怕打扰」这类笼统顾虑不算数：不点名的话，模型会拿它们当理由沉默，
+ * 主动消息就整体哑掉了。
+ * 不说 → 只输出 AMSG_SILENT_MARK，worker 认这个标记走 skip-push 出口：不推送、
+ * 不占连发额度，面板和角色下一轮聊天都会照实知道这条没发。
+ */
+export const BEFORE_SPEAK_LINES: readonly string[] = [
+  '【开口之前】',
+  `先对照上面的【最近对话上下文】（连同后面你自己发过、回过的那几句）。${AMSG_SLOT_LIVE_CHAT}`,
+  '默认是照常说你要说的话。只有两种情况这次不说：',
+  '1. 这条任务要说的事，已经在你们的对话里发生过、或者已经聊完了。',
+  '2. 你们正聊着别的，这条插进来明显会打断正在说的事，而且晚点再说也不耽误。',
+  '正聊着不等于不说：对方正等着这条、或者它跟眼下聊的接得上，就顺着话头把它说出来，像聊天里自然接上的一句，别像另起一段的通知。',
+  '拿不准就说。「怕打扰」「时机好像不太对」这种笼统的顾虑不算理由。',
+  `决定不说 → 整段输出只写 ${AMSG_SILENT_MARK} 这一个标记，别的一个字都不要写，也不要解释。`,
+];
+
+/** 对方最后一次开口在这么久之内，就算「你们此刻正聊着」。 */
+export const LIVE_CHAT_WINDOW_MS = 10 * 60_000;
 
 /**
  * 「即时对话」这一轮要发给模型的对话消息。
@@ -372,14 +538,27 @@ export interface AmsgFirePackChat {
   messages: { role: string; content: AmsgFirePackChatContent }[];
   /** 这份对话消息打包的时刻（epoch ms）。 */
   builtAt: number;
+  /**
+   * worker 时效块（时钟、实时世界、排程清单等）插在 messages 的这个下标前，
+   * 即本地「实时状态」段所在的位置，和本地路径一样把「回到你自己」留在最后。
+   * 缺省或越界时追加到末尾。
+   */
+  timelyInsertAt?: number;
 }
 
 export interface AmsgFirePack {
+  /** 模板是否含用户指定的内心独白协议；旧包缺省不回传原始推理。 */
+  thinkingChainEnabled?: boolean;
   v: typeof FIRE_PACK_VERSION;
   /** 完整 prompt 模板，时间性内容与本次任务指令留 AMSG_SLOT_* 槽位。 */
   template: string;
   /** 用户上次真实主动发消息的时间（epoch ms）；没有聊天记录时为 null。 */
   lastUserMessageAt: number | null;
+  /**
+   * 离开后消息计时起点（epoch ms）：用户上次真实发言，或最近一条线下见面 / 实时通话记录
+   * （见 utils/awayMessageCore.ts）。可选字段，不改 FIRE_PACK_VERSION，旧包缺省退回 lastUserMessageAt。
+   */
+  lastAwayAnchorAt?: number | null;
   /**
    * 角色的 IANA 时区 id（角色开了自定义时区用角色的，没开用打包设备的）。
    * worker 渲染一切给角色看的时间都以它为参照系（Intl 处理夏令时）。必填：
@@ -396,10 +575,9 @@ export interface AmsgFirePack {
   /** 用户称呼（userProfile.name || '对方'），awayHint 文案用。 */
   targetName: string;
   /**
-   * 这份模板打包的时刻（epoch ms），self_log 的 tasks 段拿它当对齐锚点：日志里记的
-   * basePackAt 和这个值不一样，说明客户端之后又传了一份新模板，自排任务已随
-   * pendingTasks 回来，tasks 段作废；连发记录（entries）不看它，只认用户有没有开口
-   * （见 reconcileSelfLogWithPack）。
+   * 这份模板打包的时刻（epoch ms）。basePackAt 记下当前快照版本，但换代本身
+   * 不能证明任务已被客户端认领；tasks 按 pendingTasks 里的 UUID 逐项去重。
+   * 连发记录只认用户有没有开口（见 reconcileSelfLogWithPack）。
    */
   builtAt: number;
   /**
@@ -615,8 +793,8 @@ export interface AmsgSelfLog {
    * 很容易把同一件事再排一遍。
    *
    * 客户端上线重放 directive 之后，这些任务会进它的本地清单，下次同步就随
-   * fire_pack.pendingTasks 一起上来——那时 tasks 段作废（basePackAt 对不上，
-   * 见 reconcileSelfLogWithPack），不会两边各记一份。
+   * fire_pack.pendingTasks 一起上来——只有已经出现的同 UUID 条目才从备账移除，
+   * 未认领的仍保留（见 reconcileSelfLogWithPack）。
    */
   tasks: ActiveMsg2TaskRecord[];
 }
@@ -629,6 +807,11 @@ export interface AmsgSelfLog {
 export const SELF_LOG_MAX_ENTRIES = 8;
 /** 单条正文留多长。主动消息本来就一两句，超出的部分基本是标签和长引用。 */
 export const SELF_LOG_TEXT_MAX = 200;
+/**
+ * 即时对话的回复留多长。回复可以是好几段长话，而下一条定时消息到点时，客户端多半还没把
+ * 带着这条回复的聊天记录传上来——角色只能从这里读到自己刚说过什么，截短了就接不上话。
+ */
+export const SELF_LOG_REPLY_TEXT_MAX = 1500;
 
 export const createSelfLog = (basePackAt: number, anchorUserMsgAt: number | null = null): AmsgSelfLog => ({
   v: 4,
@@ -655,8 +838,8 @@ export const countUnansweredSends = (log: AmsgSelfLog | null): number =>
  * - entries + unansweredSends（连发记录）只认「用户开口了」：lastUserMessageAt 比锚新
  *   就一起清零、锚前进。fire_pack 换代**不**清它们——换代多半只是客户端认领了角色自己
  *   发的推送（打脏重传），计数要是跟着清，连发提醒和上限在用户在线时就永远不会生效。
- * - tasks（自排任务备账）只认「fire_pack 换代」：客户端认领后这些任务已随
- *   pack.pendingTasks 回来，再留一份就会被记成两条。
+ * - tasks（自排任务备账）按 pack.pendingTasks 中的 UUID 逐项去重；单纯换代
+ *   不代表客户端已收下排程结果，不能清空尚未认领的任务。
  */
 export const reconcileSelfLogWithPack = (
   stored: AmsgSelfLog | null,
@@ -669,7 +852,9 @@ export const reconcileSelfLogWithPack = (
     log = { ...log, anchorUserMsgAt: lastUserMessageAt, entries: [], unansweredSends: 0, recurringSends: {} };
   }
   if (log.basePackAt !== pack.builtAt) {
-    log = { ...log, basePackAt: pack.builtAt, tasks: [] };
+    // 只有快照里明确带回的 uuid 才代表客户端已认领；打包时间本身不是回执。
+    const adopted = new Set(pack.pendingTasks.map(task => task.taskUuid));
+    log = { ...log, basePackAt: pack.builtAt, tasks: log.tasks.filter(task => !adopted.has(task.taskUuid)) };
   }
   return log;
 };
@@ -699,7 +884,7 @@ export const appendSelfLogTask = (log: AmsgSelfLog, task: ActiveMsg2TaskRecord):
  * 以及同 id 的重复追加（fire 抛错整条重跑时同一条消息会再记一次，不能算成又发了一条）。
  */
 export const appendSelfLogEntry = (log: AmsgSelfLog, entry: AmsgSelfLogEntry): AmsgSelfLog => {
-  const text = entry.text.trim().slice(0, SELF_LOG_TEXT_MAX);
+  const text = entry.text.trim().slice(0, entry.reply ? SELF_LOG_REPLY_TEXT_MAX : SELF_LOG_TEXT_MAX);
   if (!text) return log;
   const alreadyLogged = log.entries.some((e) => e.id === entry.id);
   const kept = log.entries.filter((e) => e.id !== entry.id);
@@ -780,16 +965,49 @@ export const renderSelfLogBlock = (
       `（对方未回应期间你已连着主动找了对方 ${sends} 次${limitHalf}。别把已经说过的话换个说法再讲一遍。）`,
     ].join('\n');
   }
-  const countLine = sends >= 1
-    ? `（对方一直没回应，你已连着主动找了对方 ${sends} 次${limitHalf}。往下接着说，别把已经说过的话换个说法再讲一遍，也别假装这些没发生过。）`
-    : '（这几条是你发出去的，对方还没回应。往下接着说，别把已经说过的话换个说法再讲一遍，也别假装这些没发生过。）';
-  return [
-    '',
-    '',
-    '【这之后你又发过（对方还没回）】',
-    ...fresh.map((e) => `- ${formatAgo(e.at, nowMs, tz)}　${e.text}`),
-    countLine,
-  ].join('\n');
+  // 回复和主动发的分开写：回复是在答对方刚说的话，对方看到了；主动发的那几条才是
+  // 「对方还没回」。混在一个标题下，角色会把刚答完的话当成没人理的独白。
+  const replies = fresh.filter((e) => e.reply);
+  const proactive = fresh.filter((e) => !e.reply);
+  const line = (e: AmsgSelfLogEntry) => `- ${formatAgo(e.at, nowMs, tz)}　${e.text}`;
+  const out: string[] = ['', ''];
+  if (replies.length > 0) {
+    out.push(
+      '【这之后你回了对方】',
+      ...replies.map(line),
+      '（这是你对上面对话里对方最后那几句的回复，对方已经看到了。往下说的时候接着它，别重复。）',
+    );
+  }
+  if (proactive.length > 0) {
+    if (replies.length > 0) out.push('');
+    out.push(
+      '【这之后你又发过（对方还没回）】',
+      ...proactive.map(line),
+      sends >= 1
+        ? `（对方一直没回应，你已连着主动找了对方 ${sends} 次${limitHalf}。往下接着说，别把已经说过的话换个说法再讲一遍，也别假装这些没发生过。）`
+        : '（这几条是你发出去的，对方还没回应。往下接着说，别把已经说过的话换个说法再讲一遍，也别假装这些没发生过。）',
+    );
+  } else if (sends >= 1) {
+    // 主动发的那几条正文都在转写里了，这里只补频率事实。
+    out.push(`（对方未回应期间你已连着主动找了对方 ${sends} 次${limitHalf}。别把已经说过的话换个说法再讲一遍。）`);
+  }
+  return out.join('\n');
+};
+
+/**
+ * 填进 AMSG_SLOT_LIVE_CHAT 的那一行。对方最后一次开口在 LIVE_CHAT_WINDOW_MS 之内才有，
+ * 自带前导换行；否则是空串。只说相对的「多久前」，不报钟点——关了时间感知的角色也照给。
+ */
+export const renderLiveChatLine = (
+  targetName: string,
+  lastUserMessageAt: number | null,
+  nowMs: number,
+): string => {
+  if (lastUserMessageAt == null) return '';
+  const diff = nowMs - lastUserMessageAt;
+  if (diff < 0 || diff >= LIVE_CHAT_WINDOW_MS) return '';
+  const ago = diff < 60_000 ? '刚刚' : `${Math.floor(diff / 60_000)} 分钟前`;
+  return `\n你们此刻正聊着：${targetName || '对方'}${ago}还在跟你说话。`;
 };
 
 const fillSlot = (text: string, slot: string, value: string) => text.split(slot).join(value);
@@ -824,17 +1042,28 @@ export const renderFirePack = (
     includeClock?: boolean;
     /** 已解析的连发上限（Infinity = 不限）。 */
     maxUnansweredSends?: number;
+    /**
+     * 到点时已知的对方最后一次开口。打包之后对方又说过话（在场记录比包新）时由调用方
+     * 传进来；不传用包里那份。
+     */
+    lastUserMessageAt?: number | null;
+    /** 到点必发、不给角色选择不说（离开后消息）：模板里【开口之前】那段整个拿掉。 */
+    mustSpeak?: boolean;
   },
 ): string => {
   const tz: AmsgTzRef = { tzId: pack.tzId };
   const currentTime = formatFireTimeFull(nowMs, tz);
-  const diffMinutes = pack.lastUserMessageAt == null
+  const lastUserMessageAt = extras?.lastUserMessageAt !== undefined
+    ? extras.lastUserMessageAt
+    : pack.lastUserMessageAt ?? null;
+  const diffMinutes = lastUserMessageAt == null
     ? null
-    : Math.max(0, Math.floor((nowMs - pack.lastUserMessageAt) / 60_000));
+    : Math.max(0, Math.floor((nowMs - lastUserMessageAt) / 60_000));
   const timeSinceUser = formatTimeSinceUser(diffMinutes);
   const awayHint = buildAwayHint(pack.targetName, timeSinceUser);
 
   let out = pack.template;
+  if (extras?.mustSpeak) out = out.split(`${BEFORE_SPEAK_LINES.join('\n')}\n`).join('');
   out = fillSlot(out, AMSG_SLOT_CURRENT_TIME, currentTime);
   // 对方那边的钟：跟上面那行是两个主体各自的时间，文案里各自写清主语（见 buildUserClockHint）。
   out = fillSlot(out, AMSG_SLOT_USER_CLOCK, buildUserClockHint(nowMs, tz, { tzId: pack.userTzId }, pack.targetName));
@@ -844,6 +1073,7 @@ export const renderFirePack = (
   out = fillSlot(out, AMSG_SLOT_SELF_LOG, renderSelfLogBlock(
     extras?.selfLog ?? null, nowMs, tz, extras?.maxUnansweredSends ?? DEFAULT_MAX_UNANSWERED_SENDS,
   ));
+  out = fillSlot(out, AMSG_SLOT_LIVE_CHAT, renderLiveChatLine(pack.targetName, lastUserMessageAt, nowMs));
   out = fillSlot(out, AMSG_SLOT_TASK_LIST, extras?.taskListBlock ?? '');
   out = fillSlot(out, AMSG_SLOT_SCENE, renderFireSceneBlock(pack.scene, nowMs, tz, {
     includeClock: extras?.includeClock !== false,
@@ -864,14 +1094,8 @@ export const renderFirePack = (
  */
 export const FIRE_PACK_VERSION = 7;
 
-/**
- * 即时对话任务行的 messageSubtype 标签。上游只当自由文本原样透传；客户端两处都认它：
- * 排程时写（activeMsgClient.sendInstantChat）、面板对账时滤（amsg2Tasks 的
- * reconcileTasksWithRemote——即时对话的行不补进任务清单，不然用户正等着的一轮会显示
- * 成「待触发」，还可能被「取消全部」顺手掐掉）。写读两侧靠这一个常量绑死：它是
- * GET /messages 明文投影里唯一可查的即时对话标记，producer 改个说法 filter 就瞎了。
- */
-export const AMSG_INSTANT_CHAT_SUBTYPE = 'instant-chat';
+/** 即时对话任务行的 messageSubtype；定义和分类规则在 amsgTaskKinds。 */
+export { AMSG_INSTANT_CHAT_SUBTYPE } from './amsgTaskKinds';
 
 /**
  * 解析失败时给人看的一句原因。
@@ -888,7 +1112,7 @@ export const describeFirePackVersion = (value: string): string => {
     return `包是 v${v}、worker 要 v${FIRE_PACK_VERSION} —— 前端比 worker 旧，打开一次网页让它重新上传`;
   }
   if (typeof v === 'number') {
-    return `包是 v${v}、worker 只认 v${FIRE_PACK_VERSION} —— worker bundle 是旧的，去设置页重新粘贴部署`;
+    return `包是 v${v}、worker 只认 v${FIRE_PACK_VERSION} —— worker bundle 是旧的，去「设置 → 主动消息 2.0」点一下「更新 Worker」`;
   }
   return '包里没有版本号（数据损坏）';
 };
@@ -910,8 +1134,9 @@ const chatContentOk = (content: unknown): boolean => {
 const chatFieldOk = (chat: unknown): boolean => {
   if (chat === undefined) return true;
   if (!chat || typeof chat !== 'object' || Array.isArray(chat)) return false;
-  const { messages, builtAt } = chat as Partial<AmsgFirePackChat>;
+  const { messages, builtAt, timelyInsertAt } = chat as Partial<AmsgFirePackChat>;
   return typeof builtAt === 'number'
+    && (timelyInsertAt === undefined || Number.isInteger(timelyInsertAt))
     && Array.isArray(messages) && messages.length > 0
     && messages.every((m) => !!m && typeof m === 'object'
       && typeof (m as { role?: unknown }).role === 'string'
@@ -928,6 +1153,7 @@ export const parseFirePack = (value: string): AmsgFirePack | null => {
       chatFieldOk(parsed.chat) &&
       typeof parsed.template === 'string' && parsed.template.length > 0 &&
       (parsed.lastUserMessageAt === null || typeof parsed.lastUserMessageAt === 'number') &&
+      (parsed.lastAwayAnchorAt === undefined || parsed.lastAwayAnchorAt === null || typeof parsed.lastAwayAnchorAt === 'number') &&
       typeof parsed.tzId === 'string' && parsed.tzId.length > 0 &&
       typeof parsed.userTzId === 'string' && parsed.userTzId.length > 0 &&
       typeof parsed.targetName === 'string' &&

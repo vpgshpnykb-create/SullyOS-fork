@@ -1,4 +1,5 @@
 import { loadCharacterContextMessages } from '../utils/chatContextRange';
+import { spaceCreatorDraftKey } from '../utils/userSpaces';
 /**
  * Like520Event.tsx
  * 520 特别活动 (2026.5.20) — "如果 char 变得小小的"
@@ -119,7 +120,9 @@ export const isSullyChar = (char: CharacterProfile): boolean => {
 export const sullyPresets = (): Record<string, string> => ({
     skin: 'skin_01',        // 新画风身体（内置素材包 parts/manifest.json；旧 skin_1 已被折叠）
     fronthair: 'fronthair_99',
+    earhair: 'earhair_99',
     back1: 'back1_99',
+    back2: 'back2_99',
     eyes: 'eyes_99',
 });
 
@@ -159,6 +162,17 @@ export const CreatorIframe: React.FC<CreatorIframeProps> = ({ mode, charName, pr
     const onConfirmRef = useRef(onConfirm);
     onConfirmRef.current = onConfirm;
 
+    // 同源 iframe 直接调用宿主出口，保留保存按钮的用户手势，也能使用原生壳的 Share 插件。
+    const connectImageExport = () => {
+        const frameWindow = iframeRef.current?.contentWindow as (Window & {
+            sullySharePng?: (dataUrl: string, fileName: string) => ReturnType<typeof shareOrDownloadBlob>;
+        }) | null;
+        if (!frameWindow) return;
+        frameWindow.sullySharePng = (dataUrl, fileName) => shareOrDownloadBlob({
+            blob: dataUrlToBlob(dataUrl), fileName, shareTitle: '保存 Chibi 图片',
+        });
+    };
+
     // init 只发一次（首次 ready）；之后绝不重发，保住用户的选择
     const postInit = () => {
         const w = iframeRef.current?.contentWindow;
@@ -173,6 +187,7 @@ export const CreatorIframe: React.FC<CreatorIframeProps> = ({ mode, charName, pr
             type: 'like520_init',
             payload: {
                 ...p,
+                draftKey: spaceCreatorDraftKey(p.draftKey, p.mode, p.charName),
                 isSully: !!p.isSully,
                 extraItems: extraItemsRef.current,
                 safeBottomPx,
@@ -211,6 +226,7 @@ export const CreatorIframe: React.FC<CreatorIframeProps> = ({ mode, charName, pr
             if (e.source !== iframeWin) return;
 
             if (e.data.type === 'like520_ready') {
+                connectImageExport();
                 readyRef.current = true;
                 if (!initSentRef.current) postInit();
             } else if (e.data.type === 'like520_result' && e.data.payload) {
@@ -247,6 +263,8 @@ export const CreatorIframe: React.FC<CreatorIframeProps> = ({ mode, charName, pr
         <iframe
             ref={iframeRef}
             src={CHAR_CREATOR_URL}
+            onLoad={connectImageExport}
+            allow="web-share"
             title={mode === 'char' ? '捏 char chibi' : '捏 user chibi'}
             className="w-full h-full border-0"
             style={{ background: 'linear-gradient(180deg, #FFF1E6 0%, #FFE4EC 100%)' }}
@@ -2396,7 +2414,7 @@ const LetterView: React.FC<{ text: string; onNext: () => void; onClose: () => vo
             // backgroundColor 用 wrapper 顶部的颜色 —— html2canvas 渲染不出
             // radial-gradient 时会拿这个色填整块 wrapper，挑顶端色能让"上面那一节"
             // 不再突变
-            const canvas = await html2canvas(target, { backgroundColor: '#fefbf4', scale: 2, useCORS: true });
+            const canvas = await html2canvas(target, { backgroundColor: '#fefbf4', scale: 2, useCORS: true, logging: false });
             const blob = await new Promise<Blob>((resolve, reject) => {
                 canvas.toBlob((result: Blob | null) => result ? resolve(result) : reject(new Error('信件图片生成失败')), 'image/png');
             });
@@ -3468,6 +3486,7 @@ export const Like520Session: React.FC<SessionProps> = ({ charId, onClose }) => {
                     <CreatorIframe
                         mode="user"
                         charName={char.name}
+                        savedState={existingData?.userChibi?.state}
                         onConfirm={handleUserChibiConfirm}
                     />
                 </div>
@@ -3620,7 +3639,12 @@ const Like520InlineApiSetup: React.FC<{ onDone: () => void; onBack: () => void }
                     max_tokens: 5,
                     stream: localStream,
                 }),
-            });
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '520特别活动',
+                    purpose: '测试连接',
+                },
+            } as RequestInit);
             if (res.ok) {
                 const data = await safeResponseJson(res);
                 const reply = data.choices?.[0]?.message?.content || '';

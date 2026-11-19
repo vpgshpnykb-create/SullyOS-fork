@@ -131,6 +131,7 @@ sullyos.devDebug.log.v1.<branch>        ← 分类捕获日志（各类混存，
 |------|------|------|--------|
 | `skipPromptBuild` | 行为 | 只发聊天历史，不注入 system prompt | 双语 / MCD / HTML / thinking 等增强全部关掉 |
 | `skipEmotionEval` | 行为 | 主回复照常，但不跑情绪副评估（本地和即时对话都算） | 关掉后情绪不更新 |
+| `forceHomeSecretRoll` | 行为 | 「秘密必定命中」：跳过本地秘密任务的 20% 抽签；即时对话缺少完整回合绑定时不生成秘密 | 默认关；仍需情绪评估开启、有 3D 小屋、已完成素材对话及本轮成功回复的明确来源，同一片段不重复；没有宠物仍不生成宠物事件。调试不可用时不生效，测试后关闭恢复 20% |
 | `mergeSystemMessages` | 行为 | 把聊天请求的多条 `role:system`（稳定前缀 / 易变尾段 / 双语·MCP 提醒条）合并成开头一条再发送（`utils/systemMessageMerge.ts`）。用途：A/B 对照中转适配层对多 system 请求的计量——同一段聊天开关各发一条，对比中转记的 prompt_tokens；合并后骤降 = 中转把「历史后的 system」重复拼接了 | 易变尾段失去 recency 位置、稳定前缀缓存失效；只作临时排障，测完关掉 |
 | `captureEnabled`<br>（记录日志·总开关） | 行为 | 日志录制总闸：关掉时所有捕获类都不抓 | 默认关；关掉只是停录，**不清**已抓日志 |
 | 捕获类 `api` | 捕获 | 抓所有走 `safeFetchJson`（`safeApi`）的 chat completions 请求 + 响应：普通聊天直发，外加 Character 里的记忆精炼/强制归档/导入清洗/批量总结/印象生成。每条带 `durationMs`（最后一次 attempt 从发起到成功/报错的耗时）和 `requestChars`（请求体字符数，messages 折叠后靠它看体积） | 取消勾选只停此后抓取，**不清**已有日志 |
@@ -252,7 +253,7 @@ appendDevDebugMcpLog({ tool, args, result });   // 没勾 mcp 时是空操作，
 `appendDevDebugLog` 自带的保护，调用方都不用操心：
 
 - **门禁**：对应 category 没勾就直接 return，零成本。
-- **脱敏**：`data` 里 key 名命中 `api_key / authorization / bearer / token / secret / endpoint / p256dh / auth` 的字段，值替换成 `<redacted>`（正则见 `SECRET_KEY_PATTERN`）。
+- **脱敏**：`data` 里 key 名命中 `api_key / authorization / bearer / token / secret / endpoint / p256dh / auth / password / cookie / device_key / spt` 等敏感字段时值替换成 `<redacted>`（正则见 `SECRET_KEY_PATTERN`）；HTTP 日志的 `url` 与任意字符串值、`label` 中嵌着的中转路径令牌、敏感查询参数、第三方推送链接与内联凭据也会一并替换为 `<redacted>`。
 - **折叠**：默认把 `data` 里超 10 字的长文本截成「前 10 字 + `...`」再落库（省空间 / 隐私）——所以你新加的捕获类导出默认也是瘦身版，要原文得复现前开「记录完整内容」，详见第九节。
 - **容量**：全局最多最近 100 条、超 1 MB 从头丢，不会撑爆 localStorage。
 - **永不抛**：内部整个包了 try/catch，日志失败不影响主流程。
@@ -282,24 +283,47 @@ LLM 日志里的聊天历史动辄几十条，整段塞进 localStorage 很快�
 
 > 折叠是**通用**的——对所有捕获类的 `data` 一视同仁，未来加的捕获类自动享受，不用各自处理。当前规则只有一条：递归遇到 key=`messages` 的数组就整组替换成 metadata，其它字段一律原样。
 
+### 主动消息复现诊断（真实 AI + 推送）
+
+入口：调试面板 → 主动消息观察窗 →「测试推送」。打开后默认沿用设置中的最新全局 API，一分钟后触发，直接点「开始测试」即可。需要换便宜模型时展开「更换 API」，可选已有预设或临时自定义，也可恢复跟随当前配置；修改只用于本次。点「调整」可改成 2／5 分钟或选择锁屏、关闭浏览器等场景。开始后切后台，等执行后先检查系统通知中心，再回来点选看到了什么、点「导出诊断报告」；「查看进度」会把每一步有没有记录画成一条时间线。界面复用设置页的 Modal 和主题色，关闭后回到观察窗。这个入口不轮询云端，也不会为了复现重建推送订阅或保持页面活跃。
+
+需要更新网页（包含推送 SW）和主动消息 Worker。创建前检查 Worker 的 `diagnosticReproduction: 1` 能力；旧 Worker 会提示更新，不发送测试任务。旧 SW 的通知记录可能缺失，不能据此判断没有送达。
+
+- 真实经过云端定时调度、所选 API 生成、正式分段、推送服务、设备收件、系统通知接口和补收。固定短提示词，输出最多 512 tokens；生成失败不自动重试，已生成内容的投递沿用正式重试。
+- 独立诊断身份与 `AmsgReproduction` 本机库，消息只进入诊断区，不写真实聊天、记忆、情绪或角色计数，不执行工具。API 配置不会覆盖全局或角色配置，Key 只随加密任务上云。
+- 报告合并复现前后的环境、订阅匹配状态、Worker 执行和推送阶段、SW 收件和 `showNotification` 结果、补收及用户观察。一次探针失败不会丢掉其他证据。通知接口完成不代表用户看到横幅，报告明确保留这一区别。
+- 云端阶段记录存于加密的 `amsg:diagnostic` client_state，保留 7 天；开始新一轮时清理本机旧记录，最多保留最近 10 轮。报告不含 API Key、完整推送订阅或普通聊天正文，但包含测试模型、环境和生成的测试消息。
+- 创建请求超时或接单后的本机保存失败时保留原编号，先查询或取消，避免重复付费调用。短时间内存在未确认的运行会阻止重复创建。
+
+走 Bark、WxPusher、MeoW 这类第三方推送或 FCM 原生通道时不经过网页的 Service Worker，时间线最多走到「推送已发出」，后面几步以手机上实际看到的为准。
+
+它用于复现传输和通知环境，不等同于完整角色行为回放：角色上下文、主动频率门禁、MCP、记忆和工具副作用不参与。若日志止于 Worker 开始前、Worker 崩溃或记录写入失败，仍可能需要对应时间段的 Worker logs；这份报告不会声称收齐平台层面的所有信息。
+
+实现入口：`components/AmsgReproductionPanel.tsx`、`utils/amsgReproductionClient.ts`、`worker/amsg/src/reproduction.ts`、`worker/diagnosticNotification.ts`。
+
 ### 主动消息的 trace 是另一套（无条件记录）
 
 上面那套要先勾选才录。主动消息这条链路另有一套 **不用勾、正式版照录** 的记录，落在 `localStorage` 的 `instant_push_trace_log_v1`（滚动留 400 条，刷新不丢），实现在 [`utils/instantTraceLog.ts`](../utils/instantTraceLog.ts)。Service Worker 那一侧的记录存在独立的 `ActiveMsgSwTrace` 库里（SW 访问不到 localStorage），导出时两边合成一份、按时间排好。
 
-入口在 amsg2 观察窗的 `trace` 那一行，点「导出全部」得到一个 json。因为不用提前开任何开关，**可以先复现、事后再导**。
+入口在主动消息观察窗底部的「导出记录」按钮，得到一个 json；最近几条原始记录收在「技术记录」折叠区里。因为不用提前开任何开关，**可以先复现、事后再导**。
 
 排「通知都弹了、聊天界面半天不出字」这类问题时，看这几个字段：
 
 | 字段 | 在哪条记录上 | 说明 |
 |---|---|---|
-| `trigger` | `runtime-flush-start` | 这趟冲刷是谁发起的。`SW通知` 是推送直达的那条；`本地巡查` 是页面自己隔几秒数收件箱数出来的（见下）；其余（`回到前台` / `启动` / `轮询补收` / `上线补收`…）各自带着更长的固有延迟 |
+| `trigger` | `runtime-flush-start` | 这趟冲刷是谁发起的。`生成前收件` 是聊天组装上下文前的本机收件（当前角色没有待收消息时不留这条）；`SW通知` 是推送直达的那条；`本地巡查` 是页面自己隔几秒数收件箱数出来的（见下）；`第三方补收` 是第三方推送模式下页面在前台时定期去云端账本拉回来的（见下）；其余（`回到前台` / `启动` / `轮询补收` / `上线补收`…）各自带着更长的固有延迟 |
 | `waitedMs` | `runtime-inbox-message` | 这条消息在收件箱里躺了多久才轮到它。跟正文长短无关，纯粹是「没人来捞」的时间。算的是它**第一次**落到这台设备的时刻——补收把同一条重新写一遍时会保住这个值，否则它永远显示「刚到」 |
+| `charId` / `waitedMs` | `runtime-before-chat-inbox-timeout` | 生成前收件等待达到 30 秒，本轮先继续，原收件管线仍在工作。这一趟跑完之前，同角色后续的生成不再等、也不再记这条 |
+| `charId` / `count` | `runtime-before-chat-inbox-pending` | 生成前收件结束时，当前角色还有 `count` 条留在收件箱（多段没到齐被扣住，或处理失败等重试）；本轮先继续 |
+| `messageId` / `charId` / `taskUuid` | `runtime-scheduled-delivery-accepted` | 已发送的定时消息进入接收流程，与用户此后是否发言无关。是否最终落库还需接着看后处理与重试记录 |
 | `count` / `posted` / `targets` | `notify-clients`（SW 侧） | SW 喊页面时找到几个页面、各自可见性、发成功几个 |
 | `portAck` / `clientsAck` | `runtime-sw-channel-probe` | 启动时的通道体检。两条路分开测：port 通而 clients 不通 = SW 活着但找不到页面 |
 
 面板上还有一行现成的结论：**实时通道正常**（附上次收到 SW 消息的时刻），或者 **没收到过 SW 实时通知**。后者意味着消息全靠本地巡查在捞，会慢那么几秒——这种状态下功能表面上是正常的（消息照样会到），所以只能靠主动看，等不到用户来报。
 
 **iOS 上这行几乎必然显示后者**，这是平台行为不是故障：App 不在最前台时，Service Worker 拿到的「当前有哪些页面」名单直接是空的，存完消息喊了也没人听见。所以页面不指望被喊——它自己隔几秒数一眼本地收件箱（`sweepLocalInbox`，纯本地读、不走网络），库里有货就冲刷。`pageshow` / `focus` / 切回前台这几个「页面刚活过来」的时刻会额外立刻数一次。数出来是 0 就什么都不做，**空转不写 trace**，否则几秒一条就能把要看的记录顶出缓冲区。
+
+**第三方推送模式**（WxPusher / Bark / MeoW）下，云端只把消息推给第三方 App，浏览器的 SW 一条都收不到：SW 侧记录里只有通道体检，看不到任何收件记录，面板显示「没收到过 SW 实时通知」，这些都是这个模式的正常现象。页面在前台时会自己去云端账本拉，trace 里记为 `第三方补收`。频率分三档：等即时回复时每 3 秒一次；本机任务清单里有定时任务快到点（到点前 1 分钟到到点后 5 分钟）时每 6 秒一次；其余时候每 60 秒一次，兜住本机不知道时间的消息（失败重发、清单还没同步的任务等）。重复任务按每天或每周推算下一次，跨夏令时那两天可能差一小时，那两次落到慢档。切回页面或点通知打开时也会马上拉一次，只有 3 秒防抖。页面在后台时不拉，等回到前台再补上。
 
 别把它跟 `轮询补收` 搞混：那个是即时对话欠着回复时每 60 秒去**云端账本**捞一圈（要分页拉、还要逐条查任务状态，全是网络），只在欠着回复时才存在。
 
@@ -381,39 +405,31 @@ SW 跑在自己的 context，没法直接访问 page 的 `localStorage` / `appen
 
 ### 现在记什么
 
-`utils/networkFailureDiagnosis.ts` 负责把能补的旁证一次性补齐，`context/OSContext.tsx` 的 fetch 拦截器
-在 `catch` 里调用它：
+日常展示的外链表情、图片和字体读取失败时沿用各自的占位图或备用字体。全局 fetch 拦截器对已识别的跨站图片、字体读取跳过系统报错和域名复检，原响应或异常仍交给调用方。表情原图缓存、分享卡预览、装扮封面取图和微博配图下载通过 `__sullyHandlesFailure` 处理无扩展名图床及图片代理。手动排查、导出或分享的结果在各自操作界面显示。
 
-```
-URL: https://sullymeow.ccwu.cc/api/health
-请求: GET · 失败于 43ms
-错误: TypeError: Failed to fetch
-目标域名: sullymeow.ccwu.cc（跨域请求，受 CORS 约束）
-本页来源: https://xxx.pages.dev
-浏览器联网状态: 在线
-Resource Timing: responseStatus=429, transferSize=0 → 对方其实回了 HTTP 429，是响应被 CORS 拦掉的，不是网络不通
-初判: 请求在拿到响应头之前就失败了——浏览器没告诉我们具体是哪一步断的。
-可能原因: 梯子/代理把这个域名的连接掐了 · DNS 解析不到 · ...
-连通性复检: no-cors 直连 sullymeow.ccwu.cc 成功 → 网络路径是通的，问题出在响应本身（...）
-```
+`utils/networkRequestSource.ts` 负责识别请求所属的具体业务子系统并对 URL 脱敏，`utils/networkFailureDiagnosis.ts` 负责把连接层与流式阶段的旁证补齐，`context/OSContext.tsx` 的全局拦截器统一组装为 `SystemLog`：
 
-两个关键设计：
+- **业务模块来源（`source`、`context.category` 与自检提示）**：按协议头、接口路径和本机已配置的服务端点（仅比对域名/路径前缀，不读密钥）区分对话模型（OpenAI `/chat/completions`、`/responses`、Anthropic `/messages`、`/models`）、记忆宫殿（Embedding / Rerank / Supabase 向量库）、主动消息 2.0（直连 Worker 或经大陆中转 `amsg-relay`）、主代理 Worker 各子路由（网易云 `/netease/*`、微博 `/weibo`、WebDAV `/webdav`、GitHub `/github`、点单 MCP、Notion、飞书、小红书、Replicate、网页抓取等）、语音 TTS/STT（MiniMax / ElevenLabs / Fish Audio）、通用 MCP（直连或 `?target=` 代理）、彼方邮局与合写诗、装扮服务及本机静态资源。旁路服务附带 `影响范围` 提示，标明该报错是否与主对话或主动消息推送无关。
+- **归属隔离（`explicit` vs `ambient`）**：调用点通过 `__sullyMeta` 显式传入归属时记为 `调用归属（调用点显式标记）`；未传显式归属的裸 `fetch` 只记 `当时前台状态（未显式传归属，可能是后台自动任务）`，防止后台记忆或同步报错串标到当前打开的聊天角色。
+- **前后台切换线索（`backgroundedDuringRequest`）**：拦截器记录请求在飞期间页面是否触发过 `visibilityState === 'hidden'`。移动端浏览器（尤其 iOS Safari / PWA）在切后台或锁屏时会挂起、切断进行中的连接，切回前台后才抛出 `Load failed`；日志据此优先提示保持前台重试。
+- **响应头到达后的流式中断（`stream-interrupted`）**：无论是透明流式升级拼包，还是私聊/见面的原生 `stream: true` 读取，只要已收到 HTTP 响应头后在正文读取途中报错，均归入 `stream-interrupted`，明确区分于连接建立前/CORS 阶段的 `blocked`，且不再额外发起 `no-cors` 根路径探测。
+- **URL 与文本凭据脱敏（`sanitizeUrlForLog` / `redactRelayTokensInText`）**：入库前将主动消息 2.0 大陆中转路径中的个人令牌（`/t/<令牌>/<worker域名>/...` → `/t/<redacted>/<worker域名>/...`）、路径首段含密钥的第三方推送域名（`api.day.app` / `api.chuckfang.com`）、敏感查询参数（`key`/`token`/`secret`/`appid`/`xsec_token`/`lat`/`lon` 等）、`user:pass@` 口令以及 `?url=` / `?target=` 内嵌地址中的敏感参数统一替换为 `<redacted>`，保留目标域名与接口路径；报错原文、HTTP 响应回显与 `console.error` 日志中夹带的敏感 URL 与内联凭据（`Bearer`、`MUSIC_U`、`SPT_`、`bark:/meow:/wxpusher:`）也会同步打码。
+- **结构化上下文字段（`context` 与 `time`）**：每条日志带本地时区可读时间 `time`、构建版本 `context.build` 及结构化诊断字段，复制日志后无需再追问版本号。
 
-1. **Resource Timing 的 `responseStatus`**：跨域也能读（不受 TAO 限制）。它 > 0 就说明**对方其实回了**，
-   那就是 CORS / 限流页的事，跟网络通不通无关——这一条直接把排查范围砍一半。
-2. **no-cors 连通性复检**：`mode: 'no-cors'` 不做 CORS 校验，只要网络路径通就会拿到 opaque 响应。
-   它成功而原请求失败 ⇒ 响应头的问题；它也失败 ⇒ 这台设备到这个域名是真的不通。结论异步回填到同一条日志。
+两个关键探针：
 
-### 失败分类别漏了 TimeoutError
+1. **Resource Timing 的 `responseStatus`**：拿到 `Timing-Allow-Origin` 授权时可读状态码。它 > 0 说明对方已返回响应，问题在响应头/CORS 或限流页，不在网络连通性。
+2. **no-cors 连通性复检**：`mode: 'no-cors'` 不做 CORS 校验，只要网络路径通就会拿到 opaque 响应。结论异步回填到同一条日志的 `detail` 与 `context.reachability`。
 
-线上第一版就踩到：`AbortSignal.timeout()` 抛出来的是 **`TimeoutError` / "signal timed out"**，
-既不含 `abort` 字样、也不是 `TypeError`，一度掉进 `unknown`，日志只剩一句「不符合已知的几种
-失败形态」。分类里 `timeout` 必须排在 `aborted` 前面判：
+### 失败分类与复检边界
 
-- `aborted`（AbortError）= 调用方自己撤了，到此为止，不用再查；
-- `timeout`（TimeoutError）= 连接**挂住不返回**，恰恰是最需要继续查的一类，要做连通性复检。
+`AbortSignal.timeout()` 抛出的是 **`TimeoutError` / "signal timed out"**，分类时与主动取消区分：
 
-要不要复检统一走 `shouldProbeReachability(kind)`，别在调用点各写各的。
+- `aborted`（AbortError）= 调用方主动取消，不做复检，也不触发终端顶部的网络自查折叠卡；
+- `stream-interrupted` = 响应头已到达、正文流中途断开，域名与 CORS 均已验证通过，不做复检；
+- `timeout` / `blocked` / `unknown` = 需要继续排查连通性，统一由 `shouldProbeReachability(kind)` 放行复检。
+
+终端顶部的「网络连接失败？按这个顺序自查」折叠卡片统一走 `shouldShowNetworkSelfCheck(systemLogs)` 判断，不依赖硬编码的 `source` 字符串。
 
 ### 「失败得多快」也是证据
 
@@ -443,3 +459,14 @@ Resource Timing: responseStatus=429, transferSize=0 → 对方其实回了 HTTP 
 ## SAR 剧情与表情校对
 
 扳手内仅在 `pnpm dev` 显示此开关，默认关闭；开启后临时开放名册全部 84 段原稿及逐句表情编辑、分支返回和 JSON 导出。关闭立即恢复真实收藏锁定，未解锁预览退出；不修改星级、奖励或收藏记录，既有校对草稿保留。正式构建即使手动解锁扳手也不能启用。开关按分支随调试标志保存，细节见 [SAR 个人线](./sar-personal-lines.md)。
+
+## 家园自主行为观察（2026-10-04）
+扳手面板顶部的 HomeCompanionDebug 读取 utils/homeCompanionDebug.ts 的会话内快照。useHomeCompanion 在原有三秒决策周期发布当前阻塞条件、坐姿、距离、冷却、判断/尝试/启动/失败次数及最近八次尝试；editor 返回实际寻路失败或降级原因。面板一秒刷新倒计时，不主动调用引擎，不触发 LLM。仅在 isDevDebugAvailable 门禁内可读写，不持久化，不收录聊天/门牌文本；不属于 capture 日志，无须打开记录日志。家园退出/挂起标记已停止，重新挂载重置计数；启动数不是完成数。日程家具动作的并行槽限制另行提示，不能把这份陪伴统计当作全部日程执行记录。
+
+### 私聊与家园请求准备耗时（2026-10-08）
+
+共享 `buildChatRequestPayload` 提供本地 `onPreparationStage`，将识图、记忆召回、提示词组装、协同文件柜、家园任务回执分别计时，保留原顺序和内容。家园进度区分「记忆召回」「组装提示词」，`Home timing` 的 API 日志记录对应毫秒数；ChatApp 原有 `[send→API]` 汇总增加 `payload.memory` / `payload.prompt` 等字段。计时从 `KeepAlive.start()` 前开始，`keepAlive` 单列 SW 准备等待，避免首次请求等待被漏算。`payload` 是总时间，其子阶段不得相加后再与它累加。此处只加阶段名与耗时，不加遥测、不记录正文；真实设备的额外等待需要同角色、同配置的日志对照，不能用隔离测试耗时替代。范围内已存在的家园输入不再额外整份读取角色；新输入仍读持久化记录核对范围，范围外重试继续拒绝。
+
+### 3D 素材的正常取消
+
+`Home3DView` 将实际编辑器初始化推迟到微任务，跳过 StrictMode 已清理的首次 effect，不发出废弃的素材请求。卸载时由 signal 通知编辑器清理，取消原因标记为 `Home3D disposed`。全局 fetch 日志只对 room3d 路径、信号确已取消且原因为该标记的 AbortError 不生成网络故障日志；仍把异常交回调用方。未标记取消、超时、HTTP 失败和真实联网失败保持原有诊断。回归：homeEditorLifecycle / homeAssetCancellation / networkFailureDiagnosis。

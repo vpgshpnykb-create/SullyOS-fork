@@ -1,3 +1,4 @@
+import {FRIEND_FEED_MAIN_PROMPT_PREFIX} from '../../../utils/friendFeedReplyFormat';
 /**
  * 即时对话的云端情绪评估。
  *
@@ -24,6 +25,7 @@ import {
   requestEmotionEval,
   restoreEvalPrompt as coreRestoreEvalPrompt,
   type EmotionEvalOutcome,
+  tagHomeSecretEval,
 } from '../../../utils/emotionEvalCore';
 
 /** 副 API 凭据的两种长相：任务里内联的 { baseUrl, apiKey, model }，或凭据表里的三件套。 */
@@ -37,6 +39,7 @@ export interface AmsgEmotionEvalApi {
 export interface AmsgEmotionEvalSpec {
   /** 带两个占位符的评估提示词模板。 */
   prompt: string;
+  homeSecretRequestId?: string;
   /**
    * 副 API 凭据（没单独配就是主 API 那一份）。
    *
@@ -205,5 +208,11 @@ export const runAmsgEmotionEval = async (
   charName: string,
   timeoutMs: number = EMOTION_EVAL_TIMEOUT_MS,
   signal?: AbortSignal,
-): Promise<AmsgEmotionEvalOutcome> =>
-  requestEmotionEval(api, coreRestoreEvalPrompt(spec.prompt, chatMessages, charName), timeoutMs, signal);
+): Promise<AmsgEmotionEvalOutcome> => {
+  // User-comment replies belong to the main generation. Keep its separate task
+  // out of the emotion prompt while retaining the shared history and live context.
+  const emotionMessages = chatMessages.filter(message => !(message.role === 'system'
+    && typeof message.content === 'string' && message.content.startsWith(FRIEND_FEED_MAIN_PROMPT_PREFIX)));
+  const result = await requestEmotionEval(api, coreRestoreEvalPrompt(spec.prompt, emotionMessages, charName), timeoutMs, signal);
+  return result.raw ? {...result, raw: tagHomeSecretEval(result.raw, spec.homeSecretRequestId)} : result;
+};

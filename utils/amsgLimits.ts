@@ -297,6 +297,13 @@ export const describeMinutes = (minutes: number): string => {
 
 // ─── 角色排程时的规矩 ───
 
+/**
+ * 角色自排的硬间隔，不随用户设置放开：跟已排的任务、上一次主动消息相差 2 分钟以内（含 2 分钟）
+ * 一律打回。send_at 精确到分，「不到 3 分钟」就是「2 分钟以内」。
+ * 用户把间隔设成 0 是「不介意连着找我」，不是「同一时刻排好几条」。
+ */
+export const SELF_SCHEDULE_HARD_GAP_MS = 3 * 60_000;
+
 export type SelfScheduleRecurrence = 'none' | 'daily' | 'weekly';
 export type SelfScheduleExpirePolicy = 'expire' | 'force';
 
@@ -336,16 +343,19 @@ export const checkSelfScheduleRules = (input: SelfScheduleRuleInput): SelfSchedu
       message: '用户没有让你排每天/每周重复的消息，这次只能排一次性的（去掉 recurrence 再排）。',
     };
   }
-  const conflict = findGapConflict(input.sendAtMs, limits.minSendGapMs, input.busy);
+  const userGapApplies = limits.minSendGapMs >= SELF_SCHEDULE_HARD_GAP_MS;
+  const gapMs = Math.max(limits.minSendGapMs, SELF_SCHEDULE_HARD_GAP_MS);
+  const conflict = findGapConflict(input.sendAtMs, gapMs, input.busy);
   if (conflict !== null) {
-    const gapMinutes = Math.round(limits.minSendGapMs / 60_000);
-    const earliest = earliestSlotAfter(
-      Math.max(input.earliestMs, input.sendAtMs), limits.minSendGapMs, input.busy);
+    const earliest = earliestSlotAfter(Math.max(input.earliestMs, input.sendAtMs), gapMs, input.busy);
     return {
       ok: false,
       reason: 'min_gap',
-      message: `离 ${input.formatTime(conflict)} 那次太近了：用户定了两次主动消息之间至少隔 ${describeMinutes(gapMinutes)}。`
-        + `要排的话最早 ${input.formatTime(earliest)}；没那么要紧的话，这次就别排了。`,
+      message: userGapApplies
+        ? `离 ${input.formatTime(conflict)} 那次太近了：用户定了两次主动消息之间至少隔 ${describeMinutes(Math.round(limits.minSendGapMs / 60_000))}。`
+          + `要排的话最早 ${input.formatTime(earliest)}；没那么要紧的话，这次就别排了。`
+        : `${input.formatTime(conflict)} 前后已经有一次主动消息了，同一时刻不能再排一条。`
+          + '如果是同一件事，它已经排着，不用再排；要换时间或内容，改原来那条（renew / cancel）。',
     };
   }
   return {
@@ -358,7 +368,11 @@ export const checkSelfScheduleRules = (input: SelfScheduleRuleInput): SelfSchedu
 
 export interface LimitsBriefInput {
   limits: AmsgLimits;
-  /** 用户没回期间已经主动找了 / 排了几次（前台聊天时用户刚开口，传 0）。 */
+  /**
+   * 已经占掉连发上限的次数：
+   * - `fire`（默认）：对方未回复期间已主动发出 + 已排待发的次数；
+   * - `chat`：正在回复对方刚发来的消息，此时只统计名下已排待发的自排联系。
+   */
   committedSends: number;
   /** 现在挂着几个排程任务（算任务名额）。 */
   activeTasks: number;
@@ -366,7 +380,30 @@ export interface LimitsBriefInput {
   earliestText?: string;
   /** 今天还能再主动找几次（到点生成时才知道；前台不传）。 */
   dailyRemaining?: number;
+  /** 当前所处语境：平时聊天回复用户（`chat`）还是定时主动消息触发（`fire`，默认）。 */
+  context?: 'chat' | 'fire';
+  /** 当前通道是否提供 cancel / renew 管理工具（默认 true；云端文本兼容模式无此工具时传 false）。 */
+  canManageTasks?: boolean;
 }
+
+/**
+ * 连发上限打回时的提示文案，区分「正在回复用户」与「对方未回复期间后台触发」两种语境：
+ * 平时聊天时用户刚刚发来消息，占满额度的是名下待发的自排任务，有管理工具时引导用 renew / cancel 调整现有任务。
+ */
+export const buildUnansweredLimitRejectMessage = (opts: {
+  count: number;
+  limit: number;
+  context?: 'chat' | 'fire';
+  canManageTasks?: boolean;
+}): string => {
+  if (opts.context === 'chat') {
+    const canManage = opts.canManageTasks !== false;
+    return canManage
+      ? `你名下已经排着 ${opts.count} 次待发的后续联系，用户设的连发上限是 ${opts.limit} 次——想改时间或方向请用 renew_active_message / cancel_active_message 调整现有的，这次不要再新排了。`
+      : `你名下已经排着 ${opts.count} 次待发的后续联系，用户设的连发上限是 ${opts.limit} 次——待发名额已满，这次不要再新排了。`;
+  }
+  return `对方还没回复，这期间你已经主动找了 / 排了 ${opts.count} 次，用户设的连发上限是 ${opts.limit} 次——这次别排了，等 ta 回复再说。`;
+};
 
 /**
  * 「用户给你定的规矩」那一段：只列跟排程有关、而且真在限制它的几条，说成事实。
@@ -375,21 +412,32 @@ export interface LimitsBriefInput {
 export const buildLimitsBrief = (input: LimitsBriefInput): string => {
   const { limits } = input;
   const lines: string[] = [];
+  // 额度只报「已用/上限」：说成「还能再排 N 次」读起来像在催它把名额用掉。
   if (Number.isFinite(limits.maxUnansweredSends)) {
-    const left = Math.max(0, limits.maxUnansweredSends - input.committedSends);
-    lines.push(`- 对方没回的时候，你最多连着主动找对方 ${limits.maxUnansweredSends} 次（一次可以说好几句；排好还没发的也算），`
-      + (left > 0 ? `现在还能再排 ${left} 次。` : '现在一次都不能再排了，等对方回复。'));
+    const used = Math.min(limits.maxUnansweredSends, Math.max(0, input.committedSends));
+    const canManage = input.canManageTasks !== false;
+    lines.push(
+      input.context === 'chat'
+        ? `- 下次对方回复前可挂的主动联系：已排 ${used}/${limits.maxUnansweredSends} 次（一次可以说好几句）`
+          + (used < limits.maxUnansweredSends
+            ? '。'
+            : canManage
+              ? '，已满；想改时间或方向请用 renew / cancel 调整现有的，不要再新排。'
+              : '，已满，这次不要再新排。')
+        : `- 对方没回期间的主动联系：已用 ${used}/${limits.maxUnansweredSends} 次（一次可以说好几句；排好还没发的也算）`
+          + (used < limits.maxUnansweredSends ? '。' : '，已满，等对方回复后才能再排。'),
+    );
   }
   if (limits.minSendGapMs > 0) {
     lines.push(`- 两次主动找对方之间至少隔 ${describeMinutes(Math.round(limits.minSendGapMs / 60_000))}`
       + (input.earliestText ? `，这次最早排到 ${input.earliestText}。` : '。'));
   }
   if (input.dailyRemaining !== undefined && Number.isFinite(limits.dailySendCap)) {
-    lines.push(input.dailyRemaining > 0
-      ? `- 今天还能再主动找对方 ${input.dailyRemaining} 次。`
-      : '- 今天主动找对方的次数已经用完了，要排就排到明天。');
+    const remaining = Math.min(limits.dailySendCap, Math.max(0, input.dailyRemaining));
+    lines.push(`- 今天的主动联系：已用 ${limits.dailySendCap - remaining}/${limits.dailySendCap} 次`
+      + (remaining > 0 ? '。' : '，已满，要排就排到明天。'));
   }
-  lines.push(`- 同时最多挂 ${limits.maxActiveTasks} 个排程任务，现在挂着 ${input.activeTasks} 个。`);
+  lines.push(`- 排程任务：挂着 ${input.activeTasks}/${limits.maxActiveTasks} 个。`);
   if (!limits.allowSelfRecurring) lines.push('- 只能排一次性的，不能排每天/每周重复的。');
   if (!limits.allowSelfForce) lines.push('- 排的消息到点碰上对方正在聊天会自动作罢（转成你在聊天里自然带出），没有「到点必发」。');
   return ['用户给你定的规矩（系统照着执行：超出的排不上，排上了到点也不发）：', ...lines].join('\n');

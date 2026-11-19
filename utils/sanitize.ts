@@ -1,4 +1,7 @@
 import { deduplicateVoiceText } from './voiceTextDedup';
+import { splitInlineThinking } from './assistantThinking';
+import { SULLY_HELP_COMMAND, SULLY_HELP_PREVIEW } from './sullyHelpCommand';
+import {extractFriendFeedReplyTags} from './friendFeedReplyFormat';
 /**
  * 共享 sanitize 工具 — 零依赖纯字符串处理.
  *
@@ -59,7 +62,7 @@ const stripRoleNamePrefix = (t: string): string => t.replace(/^[\w一-龥]+:\s*/
  * 保持跟 chatParser.sanitize 原版字节对齐 — 不含 READ_NOTE / XHS_x (那些只在 notification 路径剥).
  */
 const stripBusinessTagsForBubble = (t: string): string =>
-  t
+  extractFriendFeedReplyTags(extractFriendFeedReplyTags(t).text,'HOME_VISIT_REPLY').text
     .replace(/\[\[(?:ACTION|RECALL|SEARCH|DIARY|READ_DIARY|FS_DIARY|FS_READ_DIARY|DIARY_START|DIARY_END|FS_DIARY_START|FS_DIARY_END|MUSIC_ACTION)[:\s][\s\S]*?\]\]/g, '')
     // `[[记录:...]]` 整个命名空间 —— 历史渲染形态 (utils/transferFormat.ts:formatTransferRecord),
     // 模型复读历史会抄出来。能还原成动作的 (记录:TRANSFER) 在上游 chatParser / worker classifier
@@ -145,10 +148,7 @@ const collapseWhitespace = (t: string): string => t.replace(/\n{3,}/g, '\n\n').t
 // ─── notification 专用 helper ──────────────────────────────────────────────
 
 /** `<think|thinking|thought>...</...>` 整块, 含未闭合兜底 */
-const stripThinkBlocks = (t: string): string =>
-  t
-    .replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, '')
-    .replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, '');
+const stripThinkBlocks = (t: string): string => splitInlineThinking(t).content;
 
 /** `[[INNER_STATE:...]]` */
 const stripInnerState = (t: string): string => t.replace(/\[\[INNER_STATE:\s*[\s\S]*?\]\]/g, '');
@@ -260,6 +260,7 @@ function repairPairedTag(
  *  3. 开标签属性: <语音emotion=…> 少空格、全角引号 “” / 全角等号 ＝ → 规范属性
  *  4. 配对修复: 有开无闭 → 末尾补闭合 (语音的闭合会插在末尾完整 <字幕> 块之前);
  *     孤儿闭合 (无开) / 嵌套多余开标签 / 自闭合空标签 → 删除
+ *  5. 字幕嵌在语音块里: <语音>台词<字幕>中文</字幕></语音> → <语音>台词</语音>\n<字幕>中文</字幕>
  */
 export function normalizeVoiceTags(t: string): string {
   if (!/[语語]音|字幕/.test(t)) return t; // fast path
@@ -278,6 +279,16 @@ export function normalizeVoiceTags(t: string): string {
   // 4. 配对扫描: 先修语音 (闭合避让末尾字幕块), 再修字幕
   result = repairPairedTag(result, /<\/?[语語]音[^>]*>/g, tok => (/語/.test(tok) ? '語音' : '语音'), true);
   result = repairPairedTag(result, /<\/?字幕[^>]*>/g, () => '字幕', false);
+  // 5. 字幕写进了语音块里: 挪到 </语音> 后面, 否则中文会被当成台词朗读、转文字面板显示两遍
+  result = result.replace(/(<[语語]音[^>]*>)([\s\S]*?)(<\/[语語]音>)/g, (block, open: string, inner: string, close: string) => {
+    const subtitles: string[] = [];
+    const speech = inner.replace(/<字幕>([\s\S]*?)<\/字幕>/g, (_m, sub: string) => {
+      if (sub.trim()) subtitles.push(sub.trim());
+      return '';
+    });
+    if (subtitles.length === 0) return block;
+    return `${open}${speech.trim()}${close}\n<字幕>${subtitles.join('\n')}</字幕>`;
+  });
   return result;
 }
 
@@ -385,6 +396,7 @@ export function sanitizeForNotification(text: string): string {
   // 4. 反向 emoji tag 先于正向 SEND_EMOJI (反向可能也走 SEND_EMOJI 重写, 但这里直接转最终展示)
   result = replaceEmojiReverseTag(result);
   result = replaceSendEmoji(result);
+  result = result.replace(SULLY_HELP_COMMAND, SULLY_HELP_PREVIEW);
   // 5. 翻译块保留原文剥译文 (先自愈掉格式的标签, 严格提取正则才能命中)
   result = normalizeTranslationTags(result);
   result = extractTranslationOriginal(result);
@@ -477,6 +489,7 @@ interface ProtectedAtomSegment {
   raw: string;
   sanitized: unknown;
   protect: boolean;
+  meta?: unknown;
 }
 
 /**
@@ -519,6 +532,7 @@ export function sanitizeIntoSegments(text: string): Segment[] {
   const atomSegments = segmentTextWithProtectedBlocks(cleaned, {
     splitText: (plainText: string) => [plainText],
     protectedPatterns: [
+      { pattern: SULLY_HELP_COMMAND, preview: SULLY_HELP_PREVIEW, meta: 'sully-help' },
       {
         pattern: /\[html\][\s\S]*?\[\/html\]/i,
         preview: '[HTML 卡片]',
@@ -537,8 +551,13 @@ export function sanitizeIntoSegments(text: string): Segment[] {
       },
     ],
   }) as ProtectedAtomSegment[];
+  let hasSullyHelpCard = false;
   cleaned = atomSegments.map((seg) => {
     if (!seg.protect) return seg.raw;
+    if (seg.meta === 'sully-help') {
+      if (hasSullyHelpCard) return '';
+      hasSullyHelpCard = true;
+    }
     const idx = atomBlocks.length;
     atomBlocks.push({
       raw: seg.raw,

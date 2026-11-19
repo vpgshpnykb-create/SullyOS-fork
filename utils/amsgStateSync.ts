@@ -31,6 +31,8 @@
 import { APIConfig, CharacterProfile, GroupProfile, RealtimeConfig, UserProfile } from '../types';
 import { ActiveMsgClient, isLlmCredentialsReady, owesInstantChatReply } from './activeMsgClient';
 import { ActiveMsgStore } from './activeMsgStore';
+import { isAmsg2GloballyEnabled, isAmsg2WorkerActive, isAmsgGlobalDisabledError } from './amsgGlobalGate';
+import { stampStateUpdatedAt } from './amsgStateClock';
 import { hasActiveAiTask } from './amsg2Tasks';
 import { AmsgChatPresence, CHAT_PRESENCE_HEARTBEAT_MS } from './amsgChatPresence';
 import {
@@ -42,7 +44,9 @@ import {
   type LlmCredentialRow,
 } from './amsgLlmCredentials';
 import { trackEvent } from './analytics';
+import { AMSG_OWNER_CONFLICT_EVENT } from './amsgOwnerReconcile';
 import { DB } from './db';
+import { allSpaceCharacters } from './userSpaceCloudSettings';
 
 /** 失败重试的退避起点，逐次翻倍（30s → 60s → 120s）。 */
 const RETRY_BASE_MS = 30_000;
@@ -65,6 +69,17 @@ export interface AmsgSyncSnapshot {
 
 // charId → 最新快照。同角色多轮聊天只留最后一份，flush 永远用最新状态拼模板。
 const dirty = new Map<string, AmsgSyncSnapshot>();
+const stateEpochs = new Map<string, number>();
+const snapshotEpochs = new WeakMap<AmsgSyncSnapshot, number>();
+const isCurrentSnapshot = (snapshot: AmsgSyncSnapshot) =>
+  snapshotEpochs.get(snapshot) === (stateEpochs.get(snapshot.char.id) ?? 0);
+
+/** 停用/恢复使旧队列失效，旧请求的失败回调也不能重新塞回去。 */
+export const discardAmsgPendingState = (charId: string): void => {
+  stateEpochs.set(charId, (stateEpochs.get(charId) ?? 0) + 1);
+  dirty.delete(charId);
+  writePendingCharIds(readPendingCharIds().filter(id => id !== charId));
+};
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let flushing = false;
 let lifecycleBound = false;
@@ -170,7 +185,9 @@ export const markAmsgStateDirty = (
     return;
   }
 
-  dirty.set(snapshot.char.id, snapshot);
+  const queuedSnapshot = { ...snapshot };
+  snapshotEpochs.set(queuedSnapshot, stateEpochs.get(snapshot.char.id) ?? 0);
+  dirty.set(snapshot.char.id, queuedSnapshot);
   persistDirtyMark(snapshot.char.id);
   bindLifecycleListener();
   queueFlush();
@@ -188,8 +205,8 @@ export const markAmsgStateDirty = (
  */
 export const invalidateCharCloudState = async (charId: string): Promise<void> => {
   try {
-    const workerUrl = (await ActiveMsgStore.getGlobalConfig()).workerUrl?.trim();
-    if (!workerUrl) return;
+    const globalConfig = await ActiveMsgStore.getGlobalConfig();
+    if (!isAmsg2WorkerActive(globalConfig)) return;
     await ActiveMsgClient.clearCharClientState(charId);
   } catch (error) {
     console.warn(`${HEADER} 作废云端角色上下文失败（本地删除不受影响）`, charId, error);
@@ -226,7 +243,7 @@ export const markAmsgStateDirtyForAll = (scope: {
  */
 const requeue = (batch: AmsgSyncSnapshot[]) => {
   for (const snapshot of batch) {
-    if (!dirty.has(snapshot.char.id)) dirty.set(snapshot.char.id, snapshot);
+    if (isCurrentSnapshot(snapshot) && !dirty.has(snapshot.char.id)) dirty.set(snapshot.char.id, snapshot);
   }
 };
 
@@ -272,10 +289,19 @@ export const flushAmsgState = async (reason: string): Promise<void> => {
       prunePersistedMarks(all);
       return;
     }
+    if (!isAmsg2GloballyEnabled(globalConfig)) {
+      // 总开关关闭期间不发请求也不排退避；charId 底账保留在 localStorage，重新开启后补传。
+      dirty.clear();
+      deferredIds.clear();
+      return;
+    }
 
-    for (const snapshot of batch) dirty.delete(snapshot.char.id);
-    await ActiveMsgClient.syncCharFirePacks(batch.map((snapshot) => ({
+    const currentBatch = batch.filter(isCurrentSnapshot);
+    if (!currentBatch.length) return;
+    for (const snapshot of currentBatch) dirty.delete(snapshot.char.id);
+    await ActiveMsgClient.syncCharFirePacks(currentBatch.map((snapshot) => ({
       char: snapshot.char,
+      isCurrent: () => isCurrentSnapshot(snapshot),
       config: snapshot.char.activeMsg2Config!,
       userProfile: snapshot.userProfile,
       groups: snapshot.groups,
@@ -342,10 +368,13 @@ export const resumePendingAmsgStateSync = (scope: {
 }) => {
   // 工具凭据的欠账也在这儿补。底账只记「欠着一次」，凭据本体不落 localStorage
   // （那等于把 token 又抄一份到别的地方），补传用启动时这份最新配置——它本来就是
-  // 云端此刻该有的那一份。
-  if (hasPersistedToolConfigMark()) syncAmsgToolConfig(scope.realtimeConfig);
-  // LLM 凭据行同理（同样只记欠账、不落凭据本体）。
-  if (scope.apiConfig && hasPersistedCredSyncMark()) syncAmsgLlmCredentials(scope.apiConfig);
+  // 云端此刻该有的那一份。重试沿用原保存版本，已冲突的版本等待用户核对后新保存。
+  if (hasPersistedToolConfigMark()) {
+    const saved = readToolConfigSyncVersion();
+    queueToolConfigSnapshot(scope.realtimeConfig, saved?.updatedAt ?? stampStateUpdatedAt(), saved?.conflict === true);
+  }
+  // 每次启动对齐主 API，覆盖下线前留下的副 API；失败仍沿用欠账与退避重试。
+  if (scope.apiConfig) syncAmsgLlmCredentials(scope.apiConfig);
 
   const pending = readPendingCharIds();
   if (pending.length === 0) return;
@@ -375,6 +404,7 @@ interface ChatPresenceLease {
   timer: ReturnType<typeof setInterval>;
   /** 本轮最新的「最近一条真实用户消息」时间戳；续租时读它，不吃闭包里的陈旧值。 */
   lastUserMessageAt: number | null;
+  scene?: 'date';
 }
 
 // charId → 心跳租约。同一 char 只保留一个 timer（重入只刷新 lastUserMessageAt）。
@@ -415,19 +445,28 @@ export const syncAmsgToolConfigAndPrompts = (
 // 所以这里给它配上和 fire_pack 同款的退避重试 + localStorage 底账。
 
 export const AMSG2_PENDING_TOOL_CONFIG_LS_KEY = 'amsg2_pending_tool_config';
+const TOOL_CONFIG_SYNC_VERSION_KEY = 'amsg2_pending_tool_config_version';
 
 /** 待上传的那份配置。undefined 也是合法载荷（= 什么都没配），所以另用 flag 表示「欠着」。 */
 let pendingToolConfig: RealtimeConfig | undefined;
 let hasPendingToolConfig = false;
 let toolConfigSyncing = false;
+let pendingToolConfigVersion = 0;
+let toolConfigConflict = false;
 let toolConfigRetryCount = 0;
 let toolConfigRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 const writeToolConfigMark = (pending: boolean) => {
   // 存储满 / 隐私模式写不进去就算了：底账只是给「重试没等到就被杀」兜底的。
   try {
-    if (pending) localStorage.setItem(AMSG2_PENDING_TOOL_CONFIG_LS_KEY, '1');
-    else localStorage.removeItem(AMSG2_PENDING_TOOL_CONFIG_LS_KEY);
+    if (pending) {
+      localStorage.setItem(AMSG2_PENDING_TOOL_CONFIG_LS_KEY, '1');
+      // 只存版本和冲突状态，凭据仍从原设置读取。
+      localStorage.setItem(TOOL_CONFIG_SYNC_VERSION_KEY, JSON.stringify({ updatedAt: pendingToolConfigVersion, conflict: toolConfigConflict }));
+    } else {
+      localStorage.removeItem(AMSG2_PENDING_TOOL_CONFIG_LS_KEY);
+      localStorage.removeItem(TOOL_CONFIG_SYNC_VERSION_KEY);
+    }
   } catch { /* 见上 */ }
 };
 
@@ -435,11 +474,19 @@ const hasPersistedToolConfigMark = (): boolean => {
   try { return localStorage.getItem(AMSG2_PENDING_TOOL_CONFIG_LS_KEY) === '1'; } catch { return false; }
 };
 
+const readToolConfigSyncVersion = (): { updatedAt: number; conflict: boolean } | null => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(TOOL_CONFIG_SYNC_VERSION_KEY) || 'null');
+    return Number.isSafeInteger(saved?.updatedAt) && saved.updatedAt > 0 ? saved : null;
+  } catch { return null; }
+};
+
 const runToolConfigSync = async (reason: string): Promise<void> => {
-  if (!hasPendingToolConfig || toolConfigSyncing) return;
+  if (!hasPendingToolConfig || toolConfigSyncing || toolConfigConflict) return;
   toolConfigSyncing = true;
   // 记下这次传的是哪一份：上传期间用户又改了配置的话，清账不能把新的那份一起清掉。
   const snapshot = pendingToolConfig;
+  const version = pendingToolConfigVersion;
   try {
     const globalConfig = await ActiveMsgStore.getGlobalConfig();
     if (!globalConfig.workerUrl?.trim()) {
@@ -449,20 +496,35 @@ const runToolConfigSync = async (reason: string): Promise<void> => {
       writeToolConfigMark(false);
       return;
     }
-    await ActiveMsgClient.syncToolConfig(snapshot);
-    if (pendingToolConfig === snapshot) {
+    if (!isAmsg2GloballyEnabled(globalConfig)) {
+      // 总开关暂停期间保留 localStorage 待传标记，清掉内存队列与重试，待重新开启后对齐。
+      hasPendingToolConfig = false;
+      pendingToolConfig = undefined;
+      return;
+    }
+    await ActiveMsgClient.syncToolConfig(snapshot, { updatedAt: version });
+    if (pendingToolConfigVersion === version) {
       hasPendingToolConfig = false;
       pendingToolConfig = undefined;
       writeToolConfigMark(false);
     }
     toolConfigRetryCount = 0;
   } catch (error) {
+    if ((error as { code?: string })?.code === 'TOOL_CONFIG_CONFLICT') {
+      if (pendingToolConfigVersion === version) {
+        toolConfigConflict = true;
+        writeToolConfigMark(true);
+        console.warn(`${HEADER} 工具配置版本冲突，保留待同步状态，等待核对后重新保存。`);
+        try { window.dispatchEvent(new CustomEvent('amsg-tool-config-conflict')); } catch { /* 非浏览器环境 */ }
+      }
+      return;
+    }
     if (toolConfigRetryCount < MAX_RETRIES) {
       const delay = RETRY_BASE_MS * 2 ** toolConfigRetryCount;
       toolConfigRetryCount += 1;
       console.warn(`${HEADER} tool_config(${reason}) 上传失败，${Math.round(delay / 1000)}s 后重试（第 ${toolConfigRetryCount}/${MAX_RETRIES} 次）`, error);
       if (toolConfigRetryTimer != null) clearTimeout(toolConfigRetryTimer);
-      toolConfigRetryTimer = setTimeout(() => { void runToolConfigSync('retry'); }, delay);
+      toolConfigRetryTimer = setTimeout(() => { toolConfigRetryTimer = null; void runToolConfigSync('retry'); }, delay);
     } else {
       // 退避打光了（多半是离线）。底账留着：下次启动 / 下次冲刷继续补。
       console.error(`${HEADER} tool_config(${reason}) 连续 ${MAX_RETRIES} 次失败，云端仍是上一份工具配置（后台可能带着已被删掉的服务器或旧 token 调工具）`, error);
@@ -470,6 +532,11 @@ const runToolConfigSync = async (reason: string): Promise<void> => {
     }
   } finally {
     toolConfigSyncing = false;
+    if (hasPendingToolConfig && pendingToolConfigVersion !== version) {
+      if (toolConfigRetryTimer != null) { clearTimeout(toolConfigRetryTimer); toolConfigRetryTimer = null; }
+      toolConfigRetryCount = 0;
+      void runToolConfigSync('newer-config');
+    }
   }
 };
 
@@ -477,13 +544,23 @@ const runToolConfigSync = async (reason: string): Promise<void> => {
  * 工具凭据上云的唯一入口（实时感知保存、MCP 配置变更、代理地址改动都走它）。
  * 立即传一次，失败退避重试，并在 localStorage 留底账等启动 / 下次冲刷补传。
  */
-export const syncAmsgToolConfig = (realtimeConfig: RealtimeConfig | undefined): void => {
-  pendingToolConfig = realtimeConfig;
+const queueToolConfigSnapshot = (realtimeConfig: RealtimeConfig | undefined, updatedAt: number, conflict: boolean): void => {
+  // 保存独立快照，同一个设置对象被原地修改也不能改变正在发送的版本。
+  pendingToolConfig = realtimeConfig === undefined ? undefined : structuredClone(realtimeConfig);
+  pendingToolConfigVersion = updatedAt;
+  toolConfigConflict = conflict;
   hasPendingToolConfig = true;
   toolConfigRetryCount = 0;
   if (toolConfigRetryTimer != null) { clearTimeout(toolConfigRetryTimer); toolConfigRetryTimer = null; }
   writeToolConfigMark(true);
+  if (conflict) {
+    try { window.dispatchEvent(new CustomEvent('amsg-tool-config-conflict')); } catch { /* 非浏览器环境 */ }
+  }
   void runToolConfigSync('change');
+};
+
+export const syncAmsgToolConfig = (realtimeConfig: RealtimeConfig | undefined): void => {
+  queueToolConfigSnapshot(realtimeConfig, stampStateUpdatedAt(), false);
 };
 
 // ─── LLM 凭据行（credRefs）的重传 ───
@@ -515,10 +592,6 @@ const writeCredSyncMark = (pending: boolean) => {
   } catch { /* 见上 */ }
 };
 
-const hasPersistedCredSyncMark = (): boolean => {
-  try { return localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY) === '1'; } catch { return false; }
-};
-
 /**
  * 按底账里记着的 credId，用当前配置重算出这几行现在该是什么值。
  * 角色已删 / 凭据配不齐的那些直接跳过——没得算，也不该拿一份残缺的去覆盖云端。
@@ -531,9 +604,13 @@ export const buildCredentialRowsToResync = async (
     .map(parseCharCredId)
     .filter((parsed): parsed is { charId: string; purpose: 'chat' | 'emotion' } =>
       !!parsed && (parsed.purpose === 'chat' || parsed.purpose === 'emotion'));
-  if (wanted.length === 0) return [];
-
-  const all = characters ?? await DB.getAllCharacters();
+  const all = characters ?? await allSpaceCharacters();
+  // 备份恢复 / 换设备时可能没有本地凭据底账，仍需覆盖云端旧副 API。
+  for (const char of all) {
+    if (char.activeMsg2Config?.enabled && !wanted.some((item) => item.charId === char.id && item.purpose === 'chat')) {
+      wanted.push({ charId: char.id, purpose: 'chat' });
+    }
+  }
   const byId = new Map(all.map((char) => [char.id, char]));
   const rows: LlmCredentialRow[] = [];
   for (const { charId, purpose } of wanted) {
@@ -547,6 +624,38 @@ export const buildCredentialRowsToResync = async (
   return rows;
 };
 
+const isOwnerRetired = (error: unknown): boolean =>
+  (error as { code?: unknown } | null)?.code === 'CLOUD_OWNER_RETIRED';
+
+/**
+ * 上传凭据行。服务端整批放在一个事务里写，只要一个角色在云端已停用（或停用后在别处恢复、
+ * 本机代次对不上），整批都会被拒；这时按角色拆开重传，让其余角色的新凭据照常落地。
+ * 返回被拒的角色 ID。
+ */
+export const putCredentialRowsSkippingRetired = async (rows: LlmCredentialRow[]): Promise<string[]> => {
+  try {
+    await ActiveMsgClient.putLlmCredentials(rows);
+    return [];
+  } catch (error) {
+    if (!isOwnerRetired(error)) throw error;
+  }
+  const byChar = new Map<string, LlmCredentialRow[]>();
+  for (const row of rows) {
+    const charId = parseCharCredId(row.credId)?.charId ?? row.credId;
+    byChar.set(charId, [...(byChar.get(charId) ?? []), row]);
+  }
+  const retired: string[] = [];
+  for (const [charId, group] of byChar) {
+    try {
+      await ActiveMsgClient.putLlmCredentials(group);
+    } catch (error) {
+      if (!isOwnerRetired(error)) throw error;
+      retired.push(charId);
+    }
+  }
+  return retired;
+};
+
 const runLlmCredentialSync = async (reason: string): Promise<void> => {
   if (!hasPendingCredSync || credSyncing) return;
   credSyncing = true;
@@ -554,16 +663,34 @@ const runLlmCredentialSync = async (reason: string): Promise<void> => {
   const snapshot = pendingCredApiConfig;
   try {
     const globalConfig = await ActiveMsgStore.getGlobalConfig();
-    // 没配 worker、或这台 worker 还不认凭据表 = 这几行没有去处，不是「传失败」，连底账一起清掉。
-    if (!globalConfig.workerUrl?.trim() || !snapshot || !(await isLlmCredentialsReady())) {
+    // 没配 Worker / 没有 API 快照时没有同步目标，清掉底账。
+    if (!globalConfig.workerUrl?.trim() || !snapshot) {
       hasPendingCredSync = false;
       pendingCredApiConfig = undefined;
       writeCredSyncMark(false);
       return;
     }
-    const rows = await buildCredentialRowsToResync(snapshot);
-    // 值一个都没变（多半是这次保存改的不是 API 那几项）：不发请求，直接销账。
-    if (pickChangedCredRows(rows).length > 0) await ActiveMsgClient.putLlmCredentials(rows);
+    if (!isAmsg2GloballyEnabled(globalConfig)) {
+      // 总开关暂停期间保留 localStorage 欠账标记，恢复开启时统一重传最新凭据。
+      hasPendingCredSync = false;
+      pendingCredApiConfig = undefined;
+      return;
+    }
+    if (await isLlmCredentialsReady()) {
+      const characters = await allSpaceCharacters();
+      const rows = await buildCredentialRowsToResync(snapshot, characters);
+      const retired = pickChangedCredRows(rows).length > 0 ? await putCredentialRowsSkippingRetired(rows) : [];
+      if (retired.length > 0) {
+        // 重试也过不去，不留欠账；点名告诉用户是哪个角色、怎么处理。
+        const names = retired.map((id) => `${characters.find((char) => char.id === id)?.name ?? '未知角色'}（${id}）`).join('、');
+        console.warn(`${HEADER} 这些角色在云端已停用，凭据没有更新：${names}。其余角色已正常更新。`);
+        // 让对账弹窗出来问用户：继续使用还是删除本机。
+        if (typeof window !== 'undefined') window.dispatchEvent(new Event(AMSG_OWNER_CONFLICT_EVENT));
+      }
+    }
+    // 老 Worker 的内联任务也要迁移；新 Worker 的引用任务只更新引用，不塞内联字段。
+    const refresh = await ActiveMsgClient.refreshApiCredentialsForPendingTasks(snapshot);
+    if (refresh.failed > 0) throw new Error(`${refresh.failed} 个任务的 API 凭据尚未同步`);
     if (pendingCredApiConfig === snapshot) {
       hasPendingCredSync = false;
       pendingCredApiConfig = undefined;
@@ -584,15 +711,20 @@ const runLlmCredentialSync = async (reason: string): Promise<void> => {
     }
   } finally {
     credSyncing = false;
+    // 上传途中又切了 API：旧请求结束后立刻接着传最新一份，不能等下次启动。
+    if (hasPendingCredSync && pendingCredApiConfig !== snapshot) {
+      if (credRetryTimer != null) { clearTimeout(credRetryTimer); credRetryTimer = null; }
+      credRetryCount = 0;
+      void runLlmCredentialSync('newer-config');
+    }
   }
 };
 
 /**
- * 聊天 API / 角色单独 API / 情绪评估 API 改过之后，把云端那几行凭据对齐的唯一入口。
+ * 聊天 API / 情绪评估 API 改过之后，把云端那几行凭据对齐的唯一入口。
  *
  * 立即传一次，失败退避重试，并在 localStorage 留底账等启动 / 下次冲刷补传。
- * 老 worker（不支持凭据表）上它是 no-op——那条路的凭据仍冻结在任务里，靠
- * refreshApiCredentialsForPendingTasks 逐条补刷。
+ * 老 worker 没有凭据表，仍通过 refreshApiCredentialsForPendingTasks 逐条补刷。
  */
 export const syncAmsgLlmCredentials = (apiConfig: APIConfig): void => {
   pendingCredApiConfig = apiConfig;
@@ -744,7 +876,9 @@ export type AmsgResetCloudWipe =
 export const wipeAmsgCloudDataForReset = async (): Promise<AmsgResetCloudWipe> => {
   let workerUrl = '';
   try {
-    workerUrl = (await ActiveMsgStore.getGlobalConfig()).workerUrl?.trim() || '';
+    const config = await ActiveMsgStore.getGlobalConfig();
+    if (!isAmsg2WorkerActive(config)) return { status: 'skipped' };
+    workerUrl = config.workerUrl?.trim() || '';
   } catch {
     // 连本地配置都读不到，等于无从判断有没有云端；按没有处理，别为它拦下重置。
     return { status: 'skipped' };
@@ -764,27 +898,36 @@ export const wipeAmsgCloudDataForReset = async (): Promise<AmsgResetCloudWipe> =
   return { status: 'failed', workerUrl, detail: reasons.join('、') };
 };
 
-const writeChatPresence = (charId: string, lastUserMessageAt: number | null) => {
+const writeChatPresence = (charId: string, lastUserMessageAt: number | null, scene?: 'date') => {
   const presence: AmsgChatPresence = {
     v: 1,
     charId,
     activeAt: Date.now(),
     lastUserMessageAt,
+    ...(scene ? { scene } : {}),
   };
   // 写入失败只 warn：心跳故障不能打断正常聊天，下一次 interval 继续尝试；远端 45s TTL 兜底。
   ActiveMsgClient.syncChatPresence(charId, presence).catch((error) => {
+    if (isAmsgGlobalDisabledError(error)) {
+      stopAmsgChatPresence(charId, scene);
+      return;
+    }
     console.warn(`${HEADER} 活跃会话租约写入失败（45s TTL 自然失效）`, error);
   });
 };
 
-/** 一轮真实用户消息进入生成流程时启动租约：立即写一次，之后每 15s 续租。 */
-export const startAmsgChatPresence = (charId: string, lastUserMessageAt: number | null) => {
-  writeChatPresence(charId, lastUserMessageAt);
+/**
+ * 一轮真实用户消息进入生成流程时启动租约：立即写一次，之后每 15s 续租。
+ * 见面（DateApp）在整场见面期间续租，并传 scene: 'date'（云端据此作废到点的主动消息）。
+ */
+export const startAmsgChatPresence = (charId: string, lastUserMessageAt: number | null, scene?: 'date') => {
+  writeChatPresence(charId, lastUserMessageAt, scene);
 
   const existing = chatPresenceLeases.get(charId);
   if (existing) {
-    // 已有 timer：只刷新本轮最新的 lastUserMessageAt，复用同一个心跳。
+    // 已有 timer：只刷新本轮最新的 lastUserMessageAt / scene，复用同一个心跳。
     existing.lastUserMessageAt = lastUserMessageAt;
+    existing.scene = scene;
     return;
   }
 
@@ -793,16 +936,47 @@ export const startAmsgChatPresence = (charId: string, lastUserMessageAt: number 
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     const lease = chatPresenceLeases.get(charId);
     if (!lease) return;
-    writeChatPresence(charId, lease.lastUserMessageAt);
+    writeChatPresence(charId, lease.lastUserMessageAt, lease.scene);
   }, CHAT_PRESENCE_HEARTBEAT_MS);
-  chatPresenceLeases.set(charId, { timer, lastUserMessageAt });
+  chatPresenceLeases.set(charId, { timer, lastUserMessageAt, scene });
 };
 
-/** 停止本地续租（不发「离线」写入，远端靠 45s TTL 自然失效）。 */
-export const stopAmsgChatPresence = (charId: string) => {
+/**
+ * 停止本地续租（不发「离线」写入，远端靠 45s TTL 自然失效）。
+ * 只停同一场景开的：聊天那轮回复晚于进见面才结束时，不能把见面的租约一起停掉。
+ */
+export const stopAmsgChatPresence = (charId: string, scene?: 'date') => {
   const lease = chatPresenceLeases.get(charId);
-  if (lease) {
+  if (lease && lease.scene === scene) {
     clearInterval(lease.timer);
     chatPresenceLeases.delete(charId);
   }
+};
+
+/**
+ * 全局总开关关闭时立即停下本模块全部心跳与重试定时器，清空内存待传队列；
+ * localStorage 上的待传标记予以保留，重新开启后由 resumePendingAmsgStateSync 统一对齐。
+ */
+export const pauseAmsgStateSync = (): void => {
+  for (const lease of chatPresenceLeases.values()) {
+    clearInterval(lease.timer);
+  }
+  chatPresenceLeases.clear();
+
+  if (flushDebounceTimer != null) { clearTimeout(flushDebounceTimer); flushDebounceTimer = null; }
+  if (retryTimer != null) { clearTimeout(retryTimer); retryTimer = null; }
+  if (toolConfigRetryTimer != null) { clearTimeout(toolConfigRetryTimer); toolConfigRetryTimer = null; }
+  if (credRetryTimer != null) { clearTimeout(credRetryTimer); credRetryTimer = null; }
+
+  dirty.clear();
+  reflushRequested = false;
+  retryCount = 0;
+
+  hasPendingToolConfig = false;
+  pendingToolConfig = undefined;
+  toolConfigRetryCount = 0;
+
+  hasPendingCredSync = false;
+  pendingCredApiConfig = undefined;
+  credRetryCount = 0;
 };

@@ -40,13 +40,15 @@ vi.mock('./keepAlive', () => ({
 
 import {
   ActiveMsgClient, buildFirePack, clearNamespaceValuesOrThrow, compareRemotePushSubscription,
-  describeInstantChatFailure, dropStaleSubscription, maybeGzipRequestBody, putClientStateOrThrow,
-  readAmsgFailKind, toRemoteAvatarUrl,
+  describeInstantChatFailure, dropStaleSubscription, formatAmsgServerError, maybeGzipRequestBody,
+  putClientStateOrThrow, readAmsgFailKind, toRemoteAvatarUrl,
 } from './activeMsgClient';
 import {
   AMSG_FIRE_PACK_KEY,
   AMSG_SLOT_CURRENT_TIME, AMSG_SLOT_REALTIME_WORLD, AMSG_SLOT_SCENE,
+  AMSG_SILENT_MARK, AMSG_SLOT_LIVE_CHAT,
   AMSG_SLOT_TASK_LIST, AMSG_SLOT_TIME_SINCE_USER, AMSG_SLOT_USER_CLOCK,
+  packStateValue, registerGzipFallbackCompressor, resetGzipCompressionStateForTests, unpackStateValue,
 } from './amsgFirePack';
 import { clearInstantChatPending, setInstantChatPending } from './amsgInstantChat';
 import { AMSG_TOOL_CONFIG_KEY, AMSG_TOOL_PACK_KEY } from './amsgToolPack';
@@ -607,11 +609,19 @@ describe('ActiveMsgClient.listRemoteTasksForChar 的版本护栏', () => {
       { uuid: 'task-b', charId: null },
     ]);
     await expect(ActiveMsgClient.listRemoteTasksForChar('char-1'))
-      .rejects.toThrow(/重新粘贴部署/);
+      .rejects.toThrow(/更新 Worker/);
   });
 
   it('远端确实一条任务都没有 → 空数组（跟版本无关，别误伤）', async () => {
     vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([]);
+    await expect(ActiveMsgClient.listRemoteTasksForChar('char-1')).resolves.toEqual([]);
+  });
+
+  it('任务全是解不开的（换了 Master Key）→ 不当成老 worker，别劝人重新部署', async () => {
+    vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([
+      { uuid: 'task-a', status: 'pending', error: { code: 'STORED_DATA_UNDECRYPTABLE', message: 'x' } },
+      { uuid: 'task-b', status: 'pending', error: { code: 'STORED_DATA_UNDECRYPTABLE', message: 'x' } },
+    ]);
     await expect(ActiveMsgClient.listRemoteTasksForChar('char-1')).resolves.toEqual([]);
   });
 });
@@ -698,6 +708,7 @@ describe('scheduleCharacterTask 与欠着的即时对话 chat 段', () => {
     reiClient._encrypt.mockReset().mockResolvedValue({ iv: 'iv', authTag: 'tag', encryptedData: 'enc' });
     // 模板本体、表情全库、推送登记这些都不在被测范围，桩掉。
     vi.spyOn(DB, 'getRecentMessagesByCharId').mockResolvedValue([] as any);
+    vi.spyOn(DB, 'ensureHomeContextMessages').mockResolvedValue(undefined);
     vi.spyOn(DB, 'getEmojis').mockResolvedValue([] as any);
     vi.spyOn(DB, 'getEmojiCategories').mockResolvedValue([] as any);
     vi.spyOn(ChatPrompts, 'buildSystemPrompt').mockResolvedValue('SYS_PROMPT_MARKER');
@@ -977,6 +988,7 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
   beforeEach(() => {
     // 模板本体不在被测范围：桩掉重依赖，测打包逻辑本身。
     vi.spyOn(DB, 'getRecentMessagesByCharId').mockResolvedValue([] as any);
+    vi.spyOn(DB, 'ensureHomeContextMessages').mockResolvedValue(undefined);
     systemPromptSpy = vi.spyOn(ChatPrompts, 'buildSystemPrompt').mockResolvedValue('SYS_PROMPT_MARKER');
     vi.spyOn(ChatPrompts, 'buildMessageHistory').mockReturnValue({ apiMessages: [] } as any);
     vi.spyOn(ChatPrompts, 'filterVisibleEmojis').mockReturnValue({ emojis: [], categories: [] } as any);
@@ -984,6 +996,17 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   const pack = (char: any) => buildFirePack(char, user, [], undefined, { all: [], categories: [] });
+
+  it('关闭自主月度查阅时，主动消息模板不再提示查月份，记忆仍保留', async () => {
+    const memories = [{ id: 'recall-toggle', date: '2026-06-12', mood: 'happy', summary: '六月一起看过日落' }];
+    const enabled = await pack(baseChar({ memories }));
+    expect(enabled.template).toContain('[[RECALL: 年-月]]');
+    const char = baseChar({ memories, monthlyRecallEnabled: false, activeMemoryMonths: ['2026-06'] });
+    const before = JSON.stringify(char);
+    const disabled = await pack(char);
+    expect(disabled.template).not.toContain('[[RECALL');
+    expect(JSON.stringify(char)).toBe(before);
+  });
 
   it('角色开了自定义时区 → tzId 用角色的', async () => {
     const out = await pack(baseChar({ customTimezoneEnabled: true, customTimezone: 'Asia/Tokyo' }));
@@ -1050,6 +1073,18 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
     const { template } = await pack(baseChar());
     expect(template).toContain('日子也在往前过');
     expect(template).toContain('关心别变成查岗');
+  });
+
+  // 到点说不说由角色看着最新对话自己判。模板得把三样东西交到它手上：正聊着时那行事实的
+  // 落点、「正聊着不等于不说」这条分寸、决定不说时写什么。缺了标记，角色的「不说」就只能
+  // 是空输出，跟模型没写出来分不开。
+  it('【开口之前】带上正聊着的落点、默认是说的分寸、和不说时的标记', async () => {
+    const { template } = await pack(baseChar());
+    const section = template.slice(template.indexOf('【开口之前】'));
+    expect(section).toContain(AMSG_SLOT_LIVE_CHAT);
+    expect(section).toContain('默认是照常说');
+    expect(section).toContain('正聊着不等于不说');
+    expect(section).toContain(`只写 ${AMSG_SILENT_MARK} 这一个标记`);
   });
 
   // 回归守卫：timeAwarenessEnabled=false 的架空角色在前台连今天几号都读不到
@@ -1383,6 +1418,18 @@ describe('ActiveMsgClient.registerPushSubscription（② 订阅按用户登记�
 
     await expect(ActiveMsgClient.registerPushSubscription()).rejects.toThrow('worker 拒绝了订阅');
   });
+
+  // 真实的 amsg-client 碰到 4xx 只把信封还回来、不抛。之前没看 success，Worker 拒收
+  // （比如订阅地址格式不认）也当登记成功，用户之后一条推送都收不到。
+  it('Worker 回失败信封时同样往外抛，不当成登记成功', async () => {
+    vi.spyOn(ActiveMsgClient, 'ensurePushSubscription').mockResolvedValue(SUB_JSON as any);
+    reiClient.putPushSubscription.mockResolvedValue({
+      success: false,
+      error: { code: 'INVALID_PUSH_SUBSCRIPTION', message: '订阅地址不被接受' },
+    });
+
+    await expect(ActiveMsgClient.registerPushSubscription()).rejects.toThrow('订阅地址不被接受');
+  });
 });
 
 // 回归守卫：换一台 worker 就是换一个空的 D1，而浏览器这侧的订阅一个字都没变——
@@ -1457,11 +1504,12 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
 
   beforeEach(() => {
     reiClient.init.mockReset().mockResolvedValue(undefined);
+    vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([]);
     reiClient.updateMessage.mockReset().mockResolvedValue({ success: true });
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it('只刷「开着 2.0 且 pending 的 AI 任务」，三字段载荷；单独 API 的角色写单独 API 的值', async () => {
+  it('只刷「开着 2.0 且 pending 的 AI 任务」，旧单独 API 也统一使用主 API', async () => {
     vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
       { id: 'char-a', activeMsg2Config: { enabled: true, tasks: [
         remoteTask('a1'),
@@ -1488,13 +1536,54 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
       primaryModel: 'gpt-x',
     });
     expect(byUuid.get('c1')).toEqual({
-      apiUrl: 'https://sec.example.com/chat/completions',
-      apiKey: 'sec-key',
-      primaryModel: 'sec-model',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'new-key',
+      primaryModel: 'gpt-x',
     });
   });
 
-  it('没有 pending AI 任务（只剩 fixed / 全关掉）→ no-tasks，一个请求都不发', async () => {
+  it('迁移云端自排任务，保留情绪引用，跳过 fixed / 后台作业 / 正在等的即时回复', async () => {
+    vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
+      { id: 'char-a', activeMsg2Config: { enabled: true, tasks: [] } },
+    ] as any);
+    const remote = (uuid: string, extra: Record<string, unknown> = {}) => ({
+      uuid, charId: 'char-a', status: 'pending', messageType: 'auto', messageSubtype: 'chat', ...extra,
+    });
+    vi.mocked(ActiveMsgClient.listAllTasks).mockResolvedValue([
+      remote('ref', { credRefs: { chat: 'char:char-a/chat', emotion: 'char:char-a/emotion' } }),
+      remote('inline'),
+      remote('instant-child', { messageSubtype: 'instant-chat', credRefs: { chat: 'char:char-a/instant' } }),
+      remote('fixed', { messageType: 'fixed' }),
+      remote('job', { messageSubtype: 'job' }),
+      remote('instant', { messageSubtype: 'instant-chat' }),
+      remote('disabled', { charId: 'char-disabled' }),
+      remote('done', { status: 'completed' }),
+    ]);
+    vi.spyOn(ActiveMsgClient, 'putLlmCredentials').mockResolvedValue(1);
+    reiClient._decrypt.mockImplementation(async (payload: unknown) => payload);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({
+      status: 200,
+      text: async () => JSON.stringify({ success: true, data: { task: {
+        metadata: url.includes('instant-child') ? { amsgSelfScheduled: true } : { amsgInstantChat: true },
+      } } }),
+      headers: new Headers({ 'content-type': 'application/json' }),
+    })));
+    try {
+      const result = await ActiveMsgClient.refreshApiCredentialsForPendingTasks(API);
+      expect(result).toEqual({ status: 'ok', updated: 3, failed: 0 });
+      expect(reiClient.updateMessage.mock.calls).toEqual([
+        ['ref', { credRefs: { chat: 'char:char-a/chat', emotion: 'char:char-a/emotion' } }],
+        ['inline', { apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'new-key', primaryModel: 'gpt-x' }],
+        ['instant-child', { credRefs: { chat: 'char:char-a/chat' } }],
+      ]);
+      expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledWith([{
+        credId: 'char:char-a/chat',
+        value: { apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'new-key', primaryModel: 'gpt-x' },
+      }]);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('没有 pending AI 任务（只剩 fixed / 全关掉）→ no-tasks，不写任务凭据', async () => {
     vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
       { id: 'char-a', activeMsg2Config: { enabled: true, tasks: [remoteTask('a2', { mode: 'fixed' })] } },
     ] as any);
@@ -1504,7 +1593,7 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
     expect(reiClient.updateMessage).not.toHaveBeenCalled();
   });
 
-  it('某个角色凭据配不齐（单独 API 缺字段）→ 该角色整组记失败，别拦其他角色', async () => {
+  it('残缺的旧单独 API 不影响主 API 刷新', async () => {
     vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
       { id: 'char-broken', activeMsg2Config: {
         enabled: true,
@@ -1517,18 +1606,19 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
 
     const result = await ActiveMsgClient.refreshApiCredentialsForPendingTasks(API);
 
-    expect(result).toEqual({ status: 'partial', updated: 1, failed: 1 });
-    expect(reiClient.updateMessage.mock.calls.map((c: any[]) => c[0])).toEqual(['y1']);
+    expect(result).toEqual({ status: 'ok', updated: 2, failed: 0 });
+    expect(reiClient.updateMessage.mock.calls.map((c: any[]) => c[0])).toEqual(['x1', 'y1']);
   });
 });
 
 describe('ActiveMsgClient.refreshCharPendingAiTaskCredentials（③ 面板保存后的单角色版）', () => {
   beforeEach(() => {
     reiClient.init.mockReset().mockResolvedValue(undefined);
+    vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([]);
     reiClient.updateMessage.mockReset().mockResolvedValue({ success: true });
   });
 
-  it('fixed 再滤一遍；凭据按传入的 config（面板手里的最新值）算，不读 DB', async () => {
+  it('fixed 再滤一遍；忽略旧的单独 API，按主 API 刷新', async () => {
     const result = await ActiveMsgClient.refreshCharPendingAiTaskCredentials({
       char: { id: 'char-a' } as any,
       config: {
@@ -1544,9 +1634,9 @@ describe('ActiveMsgClient.refreshCharPendingAiTaskCredentials（③ 面板保存
     expect(reiClient.updateMessage).toHaveBeenCalledTimes(1);
     expect(reiClient.updateMessage.mock.calls[0][0]).toBe('t1');
     expect(reiClient.updateMessage.mock.calls[0][1]).toEqual({
-      apiUrl: 'https://sec.example.com/chat/completions',
-      apiKey: 'sec-key',
-      primaryModel: 'sec-model',
+      apiUrl: 'https://api.example.com/chat/completions',
+      apiKey: 'k',
+      primaryModel: 'm',
     });
   });
 
@@ -1890,26 +1980,144 @@ describe('describeInstantChatFailure — 后端那句真话要露出来', () => 
     expect(describeInstantChatFailure(401, internalError('D1_ERROR: whatever')))
       .toBe('即时对话没发出去：共享密钥和 Worker 上的对不上，去「主动消息 2.0」设置里核对一下。');
   });
+
+  it('上游 400 参数校验失败时把 details 里的 missingFields / invalidFields 透传出来', () => {
+    const text = describeInstantChatFailure(400, {
+      error: {
+        code: 'INSTANT_CHAT_TASK_FAILED',
+        message: '任务没建起来，这条没发出去',
+        upstream: {
+          success: false,
+          error: {
+            code: 'INVALID_PARAMETERS',
+            message: '缺少必需参数或参数格式错误',
+            details: {
+              missingFields: ['apiKey'],
+              invalidFields: ['temperature (must be a finite number)'],
+            },
+          },
+        },
+      },
+    });
+    expect(text).toContain('缺少字段: apiKey');
+    expect(text).toContain('无效字段: temperature (must be a finite number)');
+  });
+
+  it('PUT /client-state 局部 rejected 时把被拒条目原因透传出来', () => {
+    const text = describeInstantChatFailure(409, {
+      error: {
+        code: 'INSTANT_CHAT_STATE_FAILED',
+        message: '这一轮的输入未能保存，任务没有创建',
+        upstream: {
+          success: true,
+          data: {
+            rejected: [
+              { key: 'input-1', code: 'STATE_VALUE_TOO_LARGE', message: '单条状态超限', bytes: 6000000, maxBytes: 5242880 },
+            ],
+          },
+        },
+      },
+    });
+    expect(text).toContain('input-1(单条状态超限（6000000/5242880 bytes）)');
+  });
+
+  it('503 INSTANT_CHAT_WORKER_OUTDATED 保留专属更新指引，不被通用环境变量提示覆盖', () => {
+    const text = describeInstantChatFailure(503, {
+      error: {
+        code: 'INSTANT_CHAT_WORKER_OUTDATED',
+        message: '即时对话需要更新 Worker：打开「系统设置 → 主动消息 2.0 → 配置」，点「更新 Worker」。',
+      },
+    });
+    expect(text).toContain('即时对话需要更新 Worker');
+    expect(text).not.toContain('环境变量没配齐');
+  });
+});
+
+describe('formatAmsgServerError — 通用后端错误细节透传', () => {
+  it('透传 500 INTERNAL_ERROR 的 cause（避免只剩一句「服务器内部错误」）', () => {
+    const text = formatAmsgServerError({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '服务器内部错误',
+        cause: { code: 'CLOUD_OWNER_RETIRED', message: '角色已停用，不能继续写入云端数据' },
+      },
+    }, '操作失败');
+    expect(text).toBe('服务器内部错误：CLOUD_OWNER_RETIRED: 角色已停用，不能继续写入云端数据');
+  });
+
+  it.each([
+    ['D1_STORAGE_FULL', '云端数据库满了'],
+    ['D1_DAILY_READ_LIMIT', '今天的数据库读取额度用完了'],
+    ['D1_DAILY_WRITE_LIMIT', '今天的数据库写入额度用完了'],
+  ])('%s 换成能照着做的说明，并留下代码方便排查', (code, expected) => {
+    const text = formatAmsgServerError({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '服务器内部错误',
+        cause: { code, message: 'raw D1 error' },
+      },
+    }, '操作失败');
+    expect(text).toContain(expected);
+    expect(text).toContain(`（${code}）`);
+    expect(text).not.toContain('raw D1 error');
+  });
+
+  it('Worker 解不开旧数据时说清是密钥换了、该点哪个按钮，不甩 WebCrypto 原文', () => {
+    const text = formatAmsgServerError({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '服务器内部错误',
+        cause: {
+          stage: 'request',
+          name: 'OperationError',
+          message: 'Decryption failed. This could be due to a ciphertext authentication failure, bad padding, incorrect CryptoKey, or another algorithm-specific reason. Input length was 113, output length expected to be 113 for AES-GCM',
+        },
+      },
+    }, '操作失败');
+    expect(text).toContain('Master Key');
+    expect(text).toContain('清空云端数据');
+    expect(text).not.toContain('ciphertext authentication failure');
+  });
+
+  it('新版 Worker 的 STORED_DATA_UNDECRYPTABLE 也给出同一套能照着做的说明', () => {
+    const text = formatAmsgServerError({
+      success: false,
+      error: { code: 'STORED_DATA_UNDECRYPTABLE', message: 'Stored data could not be decrypted with the current AMSG_MASTER_KEY' },
+    }, '操作失败');
+    expect(text).toContain('清空云端数据');
+    expect(text).toContain('（STORED_DATA_UNDECRYPTABLE）');
+  });
+
+  it('客户端体积预检无 message、只有 code 与 bytes/maxBytes 时也能拼出可读报错', () => {
+    const text = formatAmsgServerError(
+      { code: 'STATE_VALUE_TOO_LARGE', bytes: 6000000, maxBytes: 5242880 },
+      '工具配置写入未确认',
+    );
+    expect(text).toBe('STATE_VALUE_TOO_LARGE（6000000/5242880 bytes）');
+  });
 });
 
 // 大 body 走 gzip 上行（省掉密文那层 base64 的膨胀，约 25%）。这几条钉的是
 // 「压缩绝不能变成发不出去的理由」：这条路上唯一该有的结局是「压了」或「原样发」，
-// 任何一种失败都必须落回明文，而不是把整轮聊天卡在发送键上。
-describe('请求体 gzip 上行', () => {
+// 原生流缺失、抛错或产出截断 gzip 时自动切换按需加载的纯 JS gzip；连纯 JS 分包也不可用时退回明文，不把整轮聊天卡在发送键上。
+describe('请求体 gzip 上行与前端纯 JS 压缩兜底', () => {
   const bigJson = () => JSON.stringify({ v: 'ぷ'.repeat(20_000) });
+  const gunzipBuffer = (buf: ArrayBuffer) =>
+    new Response(new Response(buf).body!.pipeThrough(new DecompressionStream('gzip'))).text();
+
+  afterEach(() => {
+    resetGzipCompressionStateForTests();
+  });
 
   it('超阈值 → 压，且真能解回原文', async () => {
     const original = bigJson();
     const { body, gzipped } = await maybeGzipRequestBody(original);
     expect(gzipped).toBe(true);
     expect(body).toBeInstanceOf(ArrayBuffer);
-    const restored = await new Response(
-      new Response(body as ArrayBuffer).body!.pipeThrough(new DecompressionStream('gzip')),
-    ).text();
-    expect(restored).toBe(original);
+    expect(await gunzipBuffer(body as ArrayBuffer)).toBe(original);
   });
 
-  it('小 body 原样发：压缩省下的字节还不够抵一次 CompressionStream 的开销', async () => {
+  it('小 body 原样发：压缩省下的字节还不够抵一次压缩开销', async () => {
     const small = JSON.stringify({ hello: 'world' });
     expect(await maybeGzipRequestBody(small)).toEqual({ body: small, gzipped: false });
   });
@@ -1922,27 +2130,86 @@ describe('请求体 gzip 上行', () => {
     expect((await maybeGzipRequestBody(JSON.stringify({ cjk }))).gzipped).toBe(true);
   });
 
-  it('运行时没有 CompressionStream（老 Safari）→ 退回明文，不抛', async () => {
+  it('运行时没有 CompressionStream（老 Safari）→ 自动走纯 JS gzip 压缩并精确裁出 ArrayBuffer', async () => {
     const original = bigJson();
     const saved = globalThis.CompressionStream;
     // @ts-expect-error 故意抹掉，模拟老 Safari
     delete globalThis.CompressionStream;
     try {
-      expect(await maybeGzipRequestBody(original)).toEqual({ body: original, gzipped: false });
+      const { body, gzipped } = await maybeGzipRequestBody(original);
+      expect(gzipped).toBe(true);
+      expect(body).toBeInstanceOf(ArrayBuffer);
+      expect(await gunzipBuffer(body as ArrayBuffer)).toBe(original);
     } finally {
       globalThis.CompressionStream = saved;
     }
   });
 
-  it('压缩本身抛错 → 退回明文，不连累这一轮发送', async () => {
+  it('原生 CompressionStream 抛错 → 自动切换纯 JS gzip，不连累这一轮发送', async () => {
     const original = bigJson();
     const saved = globalThis.CompressionStream;
+    let calls = 0;
+    // @ts-expect-error 换成一个必炸的替身
+    globalThis.CompressionStream = function Broken() {
+      calls += 1;
+      throw new Error('boom');
+    };
+    try {
+      const first = await maybeGzipRequestBody(original);
+      expect(first.gzipped).toBe(true);
+      expect(await gunzipBuffer(first.body as ArrayBuffer)).toBe(original);
+      expect(calls).toBe(1);
+
+      const second = await maybeGzipRequestBody(original);
+      expect(second.gzipped).toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      globalThis.CompressionStream = saved;
+    }
+  });
+
+  it('原生 CompressionStream 静默产出半截 gzip（iOS WebKit 未刷完尾部）→ 拦截坏包并切换纯 JS 产出完整压缩包', async () => {
+    const original = bigJson();
+    const saved = globalThis.CompressionStream;
+    globalThis.CompressionStream = class TruncatedGzipStream {
+      readable: ReadableStream<Uint8Array>;
+      writable: WritableStream<Uint8Array>;
+      constructor() {
+        // 只吐出合法 gzip 头 + 几字节残片，不抛异常，模拟 WebKit 解压侧会报 incomplete data 的半成品。
+        const ts = new TransformStream<Uint8Array, Uint8Array>({
+          transform(_chunk, controller) {
+            controller.enqueue(new Uint8Array([0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3, 0xab, 0xcd]));
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    } as unknown as typeof CompressionStream;
+    try {
+      const packedState = await packStateValue(original);
+      expect(packedState.startsWith('gz1:')).toBe(true);
+      expect(await unpackStateValue(packedState)).toBe(original);
+
+      const { body, gzipped } = await maybeGzipRequestBody(original);
+      expect(gzipped).toBe(true);
+      expect(await gunzipBuffer(body as ArrayBuffer)).toBe(original);
+    } finally {
+      globalThis.CompressionStream = saved;
+    }
+  });
+
+  it('原生压缩异常且纯 JS 分包也无法加载（如首次断网）→ 退回明文，绝不阻断发送', async () => {
+    const original = bigJson();
+    const saved = globalThis.CompressionStream;
+    const prevFallback = registerGzipFallbackCompressor(() => null);
     // @ts-expect-error 换成一个必炸的替身
     globalThis.CompressionStream = function Broken() { throw new Error('boom'); };
     try {
       expect(await maybeGzipRequestBody(original)).toEqual({ body: original, gzipped: false });
+      expect(await packStateValue(original)).toBe(original);
     } finally {
       globalThis.CompressionStream = saved;
+      registerGzipFallbackCompressor(prevFallback);
     }
   });
 

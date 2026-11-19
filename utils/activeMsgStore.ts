@@ -3,6 +3,7 @@ import {
   ActiveMsg2InboxMessage,
   Amsg2ExpiredNoticeRecord,
 } from '../types';
+import { AMSG_GLOBAL_CONFIG_EVENT } from './amsgGlobalGate';
 
 const DB_NAME = 'ActiveMsg';
 // MUST be kept in sync with worker/sw-keep-alive.ts:ACTIVE_MSG_DB_VERSION.
@@ -187,7 +188,126 @@ const generateUuidV4 = () => {
   });
 };
 
+const ACTION_RESULT_APPLIED_PREFIX = 'action_result_applied:';
+/** 动作回执保留期（30 天，覆盖云端 outbox 的 28 天保留期）。 */
+const ACTION_RESULT_APPLIED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const pruneStaleActionResultReceipts = async (purgeCharId?: string): Promise<void> => {
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      const store = tx.objectStore(STORE_KV);
+      const cutoff = Date.now() - ACTION_RESULT_APPLIED_TTL_MS;
+      const req = store.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        const rec = cursor.value as KvRecord<boolean | { savedAt?: number }> | undefined;
+        if (rec && typeof rec.id === 'string' && rec.id.startsWith(ACTION_RESULT_APPLIED_PREFIX)) {
+          let shouldDelete = false;
+          if (purgeCharId) {
+            try {
+              const parsed = JSON.parse(rec.id.slice(ACTION_RESULT_APPLIED_PREFIX.length));
+              if (Array.isArray(parsed) && parsed[0] === purgeCharId) shouldDelete = true;
+            } catch { /* ignore */ }
+          }
+          if (!shouldDelete && rec.value && typeof rec.value === 'object') {
+            const savedAt = Number(rec.value.savedAt ?? 0);
+            if (savedAt > 0 && savedAt < cutoff) shouldDelete = true;
+          }
+          if (shouldDelete) cursor.delete();
+        }
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch { /* prune 尽力而为, 失败不影响主流程 */ }
+};
+
+/**
+ * 全局即时对话开没开。点过开关就听用户的；没点过的，Worker 连接验证成功过就默认开。
+ * 只填了地址、没连上过的不算：那时上云发一条挂一条，又不会退回本地生成。
+ */
+export const isInstantChatSwitchedOn = (
+  config: { instantChatEnabled?: boolean; initializedAt?: number; workerUrl?: string },
+): boolean => config.instantChatEnabled ?? Boolean(config.initializedAt && config.workerUrl?.trim());
+
 export const ActiveMsgStore = {
+  /** Deployment recovery only; never stores the Cloudflare API Token. */
+  async getReplacementPlan<T>(accountId: string, scriptName: string): Promise<T | null> {
+    return getKv<T>(`replacement-plan:${JSON.stringify([accountId, scriptName])}`);
+  },
+  async saveReplacementPlan(accountId: string, scriptName: string, plan: unknown): Promise<void> {
+    const db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_KV, 'readwrite'), store = tx.objectStore(STORE_KV);
+      tx.oncomplete = () => resolve();
+      tx.onerror = tx.onabort = () => reject(tx.error || new Error('保存重配进度失败'));
+      store.put({ id: `replacement-plan:${JSON.stringify([accountId, scriptName])}`, value: plan });
+      if (plan) store.put({ id: 'replacement-hint', value: { accountId, scriptName } });
+      else {
+        const request = store.get('replacement-hint');
+        request.onsuccess = () => {
+          const hint = request.result?.value;
+          if (hint?.accountId === accountId && hint?.scriptName === scriptName) store.delete('replacement-hint');
+        };
+      }
+    });
+  },
+  async getReplacementHint(): Promise<{ accountId: string; scriptName: string } | null> {
+    return getKv('replacement-hint');
+  },
+  /** 纯动作可以没有聊天产物，需单独保留完成回执，防止补收/ACK 重试重放动作。 */
+  async hasAppliedActionResult(charId: string, messageId: string): Promise<boolean> {
+    const val = await getKv<boolean | { savedAt?: number }>(`${ACTION_RESULT_APPLIED_PREFIX}${JSON.stringify([charId, messageId])}`);
+    if (val === true) return true;
+    if (val && typeof val === 'object') {
+      const savedAt = Number(val.savedAt ?? 0);
+      return !(savedAt > 0 && savedAt < Date.now() - ACTION_RESULT_APPLIED_TTL_MS);
+    }
+    return false;
+  },
+
+  async markActionResultApplied(charId: string, messageId: string): Promise<void> {
+    await setKv(`${ACTION_RESULT_APPLIED_PREFIX}${JSON.stringify([charId, messageId])}`, { savedAt: Date.now() });
+    void pruneStaleActionResultReceipts();
+  },
+
+  async clearCharActionResults(charId: string): Promise<void> {
+    if (!charId) return;
+    await pruneStaleActionResultReceipts(charId);
+  },
+
+  /** Targeted account deletion: never clear the shared connection or another character's inbox. */
+  async clearCharacters(characterIds: string[]): Promise<void> {
+    const ids = new Set(characterIds), db = await openDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([STORE_INBOX, STORE_KV], 'readwrite');
+      for (const name of [STORE_INBOX, STORE_KV]) {
+        const cursor = tx.objectStore(name).openCursor();
+        cursor.onsuccess = () => {
+          const row = cursor.result;
+          if (!row) return;
+          const value = row.value;
+          let remove = name === STORE_INBOX && ids.has(value.charId);
+          if (name === STORE_KV && typeof value.id === 'string') {
+            if (value.id.startsWith(EXPIRED_NOTICES_PREFIX)) remove = ids.has(value.id.slice(EXPIRED_NOTICES_PREFIX.length));
+            if (value.id.startsWith(ACTION_RESULT_APPLIED_PREFIX)) {
+              try { remove = ids.has(JSON.parse(value.id.slice(ACTION_RESULT_APPLIED_PREFIX.length))[0]); } catch { /* Unknown receipt format stays intact. */ }
+            }
+          }
+          if (remove) row.delete();
+          row.continue();
+        };
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = tx.onabort = () => reject(tx.error || new Error('角色收件箱清理失败'));
+    });
+  },
+
   /**
    * 删掉整个 ActiveMsg 库。只给「重置全部数据」用。
    *
@@ -241,6 +361,11 @@ export const ActiveMsgStore = {
       updatedAt: Date.now(),
     };
     await setKv(GLOBAL_CONFIG_KEY, next);
+    if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+      try {
+        window.dispatchEvent(new CustomEvent(AMSG_GLOBAL_CONFIG_EVENT, { detail: next }));
+      } catch { /* 非浏览器环境 */ }
+    }
     return next;
   },
 
@@ -298,14 +423,15 @@ export const ActiveMsgStore = {
   // 是 serializable 的, 第二个 caller 会等第一个 commit 后才进入, 所以同一条
   // inbox 消息绝不可能被两个 caller 同时 claim。这是把 race 关在 IDB 层。
   //
-  // 已知取舍 (TODO): 这是"先 ack 后处理"语义 —— 调用方拿到 messages 后若
-  // saveMessage 抛错, 消息已经从 inbox 删了, 会丢。当前没修是因为:
-  //   1. DB.saveMessage 用 IDB add(), 失败极罕见 (quota / corruption)
-  //   2. 改成"先 save 后 ack" 会需要把 list 和 delete 拆开, 反而把这里的
-  //      原子性优势让出去, 重新打开并发读到同一项的窗口
-  // 真要补防丢, 加一层 dead-letter / try-catch 后 put 回 inbox, 而不是
-  // 拆开这个事务。
-  async consumeInboxMessages(): Promise<ActiveMsg2InboxMessage[]> {
+  // 认领后由 runtime 负责处理失败时压回重试；不要拆开事务重新引入重复消费。
+  // 指定角色时也在同一事务里筛选、删除，其余角色留在 inbox。
+  // 按角色也是整表读出再筛：inbox 没有 charId 索引，这个库的版本号和建表由页面与
+  // Service Worker 两边共同维护。调用方先 countInboxMessages，空表不会走到这里。
+  // leave 返回 true 的消息留在 inbox 不认领。
+  async consumeInboxMessages(
+    charId?: string,
+    leave?: (message: ActiveMsg2InboxMessage) => boolean,
+  ): Promise<ActiveMsg2InboxMessage[]> {
     const db = await openDB();
     return new Promise<ActiveMsg2InboxMessage[]>((resolve, reject) => {
       const tx = db.transaction(STORE_INBOX, 'readwrite');
@@ -313,7 +439,8 @@ export const ActiveMsgStore = {
       const request = store.getAll();
       let messages: ActiveMsg2InboxMessage[] = [];
       request.onsuccess = () => {
-        messages = (request.result || []) as ActiveMsg2InboxMessage[];
+        messages = ((request.result || []) as ActiveMsg2InboxMessage[])
+          .filter(message => (charId === undefined || message.charId === charId) && !leave?.(message));
         // 一个 user turn 可能产 N 条 push (multi-chunk pushPayloads). FCM 投递不严格
         // 保序, 必须按 (sessionId, messageIndex) 排序才能拿到正确气泡顺序. 没 sessionId
         // 的走 sentAt fallback.
@@ -374,7 +501,7 @@ export const ActiveMsgStore = {
     return getKv<XhsSessionNotes>(`${XHS_SESSION_NOTES_PREFIX}${sessionId}`);
   },
 
-  // ─── 防穿帮闸·作废回执台账 ───
+  // ─── 回执台账（到点没发 / 用户手动取消）───
 
   async getExpiredNotices(charId: string): Promise<Amsg2ExpiredNoticeRecord[]> {
     const list = await getKv<Amsg2ExpiredNoticeRecord[]>(`${EXPIRED_NOTICES_PREFIX}${charId}`);
@@ -399,7 +526,7 @@ export const ActiveMsgStore = {
       const notified = alive.filter((r) => r.notifiedAt);
       next = [...unnotified, ...notified].slice(0, EXPIRED_NOTICES_MAX);
       if (unnotified.length > EXPIRED_NOTICES_MAX) {
-        console.warn('[ActiveMsgStore] 未告知作废回执超上限，最旧的被截断', { charId, dropped: unnotified.length - EXPIRED_NOTICES_MAX });
+        console.warn('[ActiveMsgStore] 未告知回执超上限，最旧的被截断', { charId, dropped: unnotified.length - EXPIRED_NOTICES_MAX });
       }
     }
     await setKv(`${EXPIRED_NOTICES_PREFIX}${charId}`, next);
@@ -422,7 +549,9 @@ export const ActiveMsgStore = {
  * 读得到哪一份数据（数据按它分区），共享密钥是端点的门禁。少一样都连不成，所以要摘
  * 就得一起摘。
  */
-const BACKEND_CONNECTION_KEYS = ['workerUrl', 'serverToken', 'masterKey', 'userId'] as const;
+// 中转令牌绑着领取人的 Discord 账号和流量记录，分享出去的备份不能带；中转开关与本机总开关
+// 跟着一起摘，免得导入别人的角色备份时跳过数据边界提醒或悄悄关掉接收方自己的 2.0 连接。
+const BACKEND_CONNECTION_KEYS = ['enabled', 'workerUrl', 'serverToken', 'masterKey', 'userId', 'pushMode', 'thirdPartyPush', 'useRelay', 'relayToken'] as const;
 
 /** 这份备份里带着后端连接吗（带了的话，谁拿到这个文件谁就能连上那台 Worker）。 */
 export const backupHasBackendConnection = (
@@ -438,7 +567,7 @@ export const backupHasBackendConnection = (
  * **后端连接默认不带走。** 备份文件是会被分享出去的——发一份角色合集给朋友，就等于把
  * 自己那台 Worker 的钥匙一起发了：对方的 App 会静默连上去，把 ta 的 API 凭据和聊天上
  * 下文写进你的 D1，而 ta 手里的主密钥能解开你那台机器上的所有密文。换设备恢复自己的
- * 备份才需要这几样，那是用户明确知道的场景，让 ta 自己勾。
+ * 文件备份才需要这几样时由用户勾选；个人云备份调用方会显式开启，避免丢掉换机所需的身份。
  *
  * 程序分不清「自己的备份」和「别人的备份」：文件里没有可信的身份标记，换新设备时用户
  * id 本来就跟备份里的对不上——而那恰恰是最正当的自己人。能判断的只有拿着文件的人，
@@ -457,8 +586,8 @@ export async function exportAmsg2GlobalConfig(
     // 白跑一段、还在日志里留一条「主动消息配置」的假账。
     return Object.keys(stripped).length > 0 ? stripped : undefined;
   } catch (e) {
-    console.warn('[amsg2] 读取全局配置失败，备份将不含这一项', e);
-    return undefined;
+    console.warn('[amsg2] 读取全局配置失败，已停止备份', e);
+    throw new Error('读取主动消息 2.0 配置失败，本次备份已中止，请稍后重试。');
   }
 }
 
@@ -479,12 +608,17 @@ export async function importAmsg2GlobalConfig(
   options: { allowBackendConnection?: boolean } = {},
 ): Promise<void> {
   if (!config || typeof config !== 'object') return;
-  const { instantChatSupported: _dropped, workerBundleVersion: _droppedVersion, ...restorable } = config;
+  const { instantChatSupported: _dropped, workerBundleVersion: _droppedVersion,
+    anthropicMessagesSupported: _droppedAnthropic, anthropicMessagesWorkerUrl: _droppedAnthropicUrl, ...restorable } = config;
   if (!options.allowBackendConnection) {
     for (const key of BACKEND_CONNECTION_KEYS) delete restorable[key];
+  } else if (backupHasBackendConnection(config)) {
+    // 历史开启态备份里 enabled 常为缺省（JSON 不含该键）；本机若正处在暂停态，还原连接时需一并按备份恢复为开启。
+    restorable.enabled = restorable.enabled !== false;
   }
   if (Object.keys(restorable).length === 0) return;
-  await ActiveMsgStore.saveGlobalConfig({ ...restorable, instantChatSupported: undefined, workerBundleVersion: undefined });
+  await ActiveMsgStore.saveGlobalConfig({ ...restorable, instantChatSupported: undefined, workerBundleVersion: undefined,
+    anthropicMessagesSupported: undefined, anthropicMessagesWorkerUrl: undefined });
 }
 
 export const maskActiveMsgUserId = (userId: string) => {

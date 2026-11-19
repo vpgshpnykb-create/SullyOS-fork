@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import {
     CaretLeft,
     CaretRight,
+    DownloadSimple,
     ChatCircleDots,
     Image,
     MagnifyingGlass,
@@ -30,12 +31,16 @@ import {
     type VoiceFavoriteSource,
 } from '../../utils/voiceFavorites';
 import { normalizeChatSearchText, searchableChatMessageText } from '../../utils/chatMessageSearch';
+import TokenImg from '../os/TokenImg';
+import { shareOrDownloadBlob } from '../../utils/shareExport';
+import { trackEvent } from '../../utils/analytics';
 
 const PAGE_SIZE = 10;
 type FavoriteTab = 'chat' | 'voice' | 'image';
 type VoiceSourceFilter = 'all' | VoiceFavoriteSource;
 
 interface FavoritesPortalProps {
+    inline?: boolean;
     onClose: () => void;
     onJumpToMessage?: (charId: string, messageId: number) => void;
 }
@@ -69,7 +74,7 @@ const messageTypeLabel = (type?: string): string => ({
     life_card: '生活记录',
 }[type || ''] || '聊天消息');
 
-const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMessage }) => {
+const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMessage, inline=false }) => {
     const [tab, setTab] = useState<FavoriteTab>('chat');
     const [contentItems, setContentItems] = useState<ContentFavorite[]>([]);
     const [voiceItems, setVoiceItems] = useState<VoiceFavorite[]>([]);
@@ -83,6 +88,8 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
     const [resolving, setResolving] = useState(false);
     const [playingId, setPlayingId] = useState<string | null>(null);
     const [audioError, setAudioError] = useState<string | null>(null);
+    const [exportingVoice, setExportingVoice] = useState<string | null>(null);
+    const exportInFlight = useRef(false);
     const [previewImage, setPreviewImage] = useState<string | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const objectUrlRef = useRef<string | null>(null);
@@ -267,6 +274,31 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
         const message = resolvedMessage || item.snapshot || null;
         const sourceAvailable = !!(resolved && 'sourceAvailable' in resolved && resolved.sourceAvailable);
         const missing = !!resolved && !message;
+        if (item.conversation?.length) return (
+            <article key={item.id} className="favorite-row py-4 border-b border-slate-900/10">
+                <div className="flex items-start gap-2">
+                    <details className="group min-w-0 flex-1">
+                        <summary className="cursor-pointer text-sm text-slate-800">
+                            <span className="font-bold">{item.charName}</span>
+                            <span className="ml-2 text-xs text-violet-700">对话 · {item.conversation.length} 条</span>
+                            <time className="block mt-1 text-[10px] text-slate-500">{formatTime(item.sourceTimestamp)}</time>
+                            <p className="mt-2 whitespace-pre-wrap break-words line-clamp-3 group-open:hidden">{item.snapshot?.content}</p>
+                            <span className="block mt-2 text-xs text-violet-600 group-open:hidden">展开查看对话</span>
+                            <span className="hidden mt-2 text-xs text-violet-600 group-open:block">收起对话</span>
+                        </summary>
+                        <ol className="mt-3 space-y-3">
+                            {item.conversation.map(entry => <li key={entry.messageId} className={`rounded-xl p-3 ${entry.role === 'user' ? 'ml-4 bg-violet-50' : 'mr-4 bg-slate-100'}`}>
+                                <div className="text-[10px] text-slate-500">{entry.senderName} · {formatTime(entry.timestamp)}</div>
+                                {entry.type === 'image' ? (entry.content ? <TokenImg value={entry.content} alt="收藏对话中的图片" className="mt-2 max-w-full max-h-80 object-contain rounded-lg" /> : <p className="mt-2 text-xs text-slate-400">图片未包含在这份备份中</p>)
+                                    : <p className="mt-1 text-sm whitespace-pre-wrap break-words">{entry.content || '（无文字内容）'}</p>}
+                            </li>)}
+                        </ol>
+                        {sourceAvailable && onJumpToMessage && <button type="button" className="mt-3 text-xs text-violet-600" onClick={() => onJumpToMessage(item.charId, item.messageId)}>跳回原聊天</button>}
+                    </details>
+                    <button type="button" onClick={() => void removeContent(item)} className="shrink-0 w-9 h-9 grid place-items-center rounded-full text-slate-400 active:text-rose-500" aria-label="取消收藏"><Trash size={16} /></button>
+                </div>
+            </article>
+        );
         return (
             <article key={item.id} className="favorite-row flex gap-3 py-4 border-b border-slate-900/10">
                 <button
@@ -299,6 +331,25 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
         );
     });
 
+    const downloadVoice = async (item: VoiceFavorite) => {
+        if (exportInFlight.current) return;
+        exportInFlight.current = true;
+        setExportingVoice(item.id);
+        setAudioError(null);
+        try {
+            const blob = await getVoiceFavoriteBlob(item.id);
+            if (!blob?.size) throw new Error('这条收藏的音频文件缺失，请回到来源重新收藏。');
+            const mime = blob.type.split(';')[0].toLowerCase();
+            const ext = ({ 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/x-wav': 'wav',
+                'audio/wave': 'wav', 'audio/ogg': 'ogg', 'audio/webm': 'webm', 'audio/wav': 'wav', 'audio/aac': 'aac', 'audio/flac': 'flac' } as Record<string, string>)[mime] ?? 'audio';
+            const name = item.charName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 64) || '角色';
+            const result = await shareOrDownloadBlob({ blob, fileName: `${name}_收藏语音_${item.sourceTimestamp}.${ext}`,
+                nativeChunked: true, preferDownloadOnWeb: true });
+            if (result !== 'cancelled') trackEvent('下载收藏音频');
+        } catch (cause) { setAudioError(cause instanceof Error ? cause.message : '音频保存失败，请重试。'); }
+        finally { exportInFlight.current = false; setExportingVoice(null); }
+    };
+
     const renderVoice = () => (visibleItems as VoiceFavorite[]).map(item => {
         const secondary = item.translation || item.spokenText;
         const showSecondary = !!secondary && secondary.trim() !== item.originalText.trim();
@@ -316,6 +367,9 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
                     </div>
                     <p className="mt-2 text-[14px] leading-6 text-slate-800 whitespace-pre-wrap break-words">{item.originalText || item.spokenText || '（无文字）'}</p>
                     {showSecondary && <p className="mt-1 text-[12px] leading-5 text-slate-500 whitespace-pre-wrap break-words"><span className="mr-1.5 text-[10px] font-bold text-amber-700">{item.translation ? '翻译' : '语音'}</span>{secondary}</p>}
+                    <button type="button" disabled={!!exportingVoice} className="mt-1 inline-flex items-center gap-1.5 py-2 text-xs text-slate-600" onClick={() => void downloadVoice(item)}>
+                        <DownloadSimple size={15} />{exportingVoice === item.id ? '正在准备音频…' : '下载音频'}
+                    </button>
                 </div>
                 <button type="button" onClick={() => void removeVoice(item)} className="self-start shrink-0 w-9 h-9 grid place-items-center rounded-full text-slate-400 active:bg-rose-50 active:text-rose-500" aria-label="取消收藏">
                     <Trash size={16} />
@@ -360,7 +414,7 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
     );
 
     const emptyText = tab === 'chat'
-        ? '长按有意义的聊天消息，就能收藏到这里。'
+        ? '长按消息可单条收藏，也可进入多选，将一段对话合并收藏。'
         : tab === 'voice'
             ? '在聊天、通话或见面里长按语音，就能收藏到这里。'
             : '在聊天或相册里收藏图片；这里只保存引用，不复制图片。';
@@ -481,7 +535,7 @@ const FavoritesPortal: React.FC<FavoritesPortalProps> = ({ onClose, onJumpToMess
         </div>
     );
 
-    return createPortal(portal, document.body);
+    return inline?portal:createPortal(portal, document.body);
 };
 
 export default FavoritesPortal;

@@ -382,6 +382,10 @@ const StudyApp: React.FC = () => {
             setSelectedChar(char);
         }
     }, [activeCharacterId]);
+    useAppShortcut(ShortcutAppID.Study, intent => {
+        setSelectedChar(characters.find(c => c.id === intent.characterId) || null);
+        setMode('bookshelf');
+    });
 
 
     useEffect(() => {
@@ -584,8 +588,14 @@ For each chapter, provide a title, a brief summary of what it covers, and a diff
                 messages: [{ role: "user", content: prompt }],
                 temperature: 0.5,
                 max_tokens: 8000
-            })
-        });
+            }),
+            __sullyMeta: {
+                appId: 'study',
+                appName: '自习室',
+                ...(selectedChar ? { charId: selectedChar.id, charName: selectedChar.name } : {}),
+                purpose: '拆分教材大纲',
+            },
+        } as RequestInit);
 
         if (!response.ok) throw new Error('API Error');
         const data = await safeResponseJson(response);
@@ -641,6 +651,7 @@ For each chapter, provide a title, a brief summary of what it covers, and a diff
     // [MODIFIED]: buildStudyContext Removed. We now use ContextBuilder directly in handleTeach.
 
     const handleTeach = async (course: StudyCourse, chapterIdx: number, forceRegenerate: boolean = false) => {
+
         if (!selectedChar || !effectiveApi.apiKey) return;
         
         const chapter = course.chapters[chapterIdx];
@@ -694,7 +705,7 @@ Explain this chapter's key concepts to the user based strictly on the Source Mat
                 body: JSON.stringify({
                     model: effectiveApi.model,
                     messages: isFallback ? [{ role: "user", content: prompt }]
-                        : ContextBuilder.buildCharacterRequest({ char: selectedChar, user: userProfile }, [{ role: "user", content: prompt }]),
+                        : (await ContextBuilder.buildCharacterRequest({ char: selectedChar, user: userProfile }, [{ role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 8000, 
                     safetySettings: [
@@ -703,8 +714,15 @@ Explain this chapter's key concepts to the user based strictly on the Source Mat
                         { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
                         { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
                     ]
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '生成章节讲义',
+                },
+            } as RequestInit);
         };
 
         try {
@@ -783,6 +801,7 @@ You are now acting as a private tutor for ${userProfile.name}.
     };
 
     const handleAskQuestion = async () => {
+
         if (!userQuestion.trim() || !activeCourse || !selectedChar) return;
         
         const question = userQuestion;
@@ -823,11 +842,18 @@ Answer the question based on the source material. Be helpful and encouraging (in
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'system', content: studyInstructions }, { role: "user", content: prompt }]),
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'system', content: studyInstructions }, { role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '课堂提问答疑',
+                },
+            } as RequestInit);
             
             const data = await safeResponseJson(response);
             const text = data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || "（无回答）";
@@ -879,8 +905,15 @@ Note: Use "我" (I) to refer to yourself.
         fetch(`${effectiveApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
-            body: JSON.stringify({ model: effectiveApi.model, messages: [{ role: "user", content: summaryPrompt }] })
-        }).then(res => safeResponseJson(res)).then(data => {
+            body: JSON.stringify({ model: effectiveApi.model, messages: [{ role: "user", content: summaryPrompt }] }),
+            __sullyMeta: {
+                appId: 'study',
+                appName: '自习室',
+                charId: selectedChar.id,
+                charName: selectedChar.name,
+                purpose: '结课辅导日记',
+            },
+        } as RequestInit).then(res => safeResponseJson(res)).then(data => {
             const mem = data.choices[0].message.content;
             const newMem = { id: `mem-${Date.now()}`, date: new Date().toLocaleDateString(), summary: `[教学] ${mem}`, mood: 'proud' };
             updateCharacter(selectedChar.id, { memories: [...(selectedChar.memories || []), newMem] });
@@ -1005,8 +1038,15 @@ ${chunkText.substring(0, 10000)}
                     messages: [{ role: "user", content: prompt }],
                     temperature: 0.7,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '生成随堂测验',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1057,6 +1097,7 @@ ${chunkText.substring(0, 10000)}
     };
 
     const submitQuiz = async () => {
+
         if (!quizSession || !selectedChar || !effectiveApi.apiKey) return;
         trackEvent('交卷让老师批改');
         setQuizLoading('正在批改试卷...');
@@ -1121,11 +1162,18 @@ ${resultsText}
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: reviewPrompt }]),
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: reviewPrompt }])),
                     temperature: 0.8,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '测验批改评语',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1191,6 +1239,7 @@ ${resultsText}
 
     // Follow-up Q&A on a specific question
     const handleFollowUp = async (questionId: string) => {
+
         if (!followUpInput.trim() || !selectedChar || !effectiveApi.apiKey || !quizSession) return;
         const question = quizSession.questions.find(q => q.id === questionId);
         if (!question) return;
@@ -1225,11 +1274,18 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: prompt }]),
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 4000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '错题追问讲解',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1922,3 +1978,5 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
 };
 
 export default StudyApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

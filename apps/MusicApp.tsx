@@ -99,6 +99,10 @@ const MusicApp: React.FC = () => {
   const [showLyricSync, setShowLyricSync] = useState(false);
   const [syncDraft, setSyncDraft] = useState<number[]>([]);
   const [visitCharId, setVisitCharId] = useState<string | null>(null);
+  useAppShortcut(ShortcutAppID.Music, intent => {
+    setVisitCharId(intent.characterId || null);
+    setView(intent.entryId === 'visit_char' ? (intent.characterId ? 'visit_char' : 'profile') : (intent.entryId || 'profile') as View);
+  });
   const [keyword, setKeyword] = useState('');
   const [results, setResults] = useState<Song[]>([]);
   const [searching, setSearching] = useState(false);
@@ -526,9 +530,34 @@ const MusicApp: React.FC = () => {
                     method: 'POST', headers: { 'Content-Type': 'application/json', ...(ck ? { 'X-Netease-Cookie': ck } : {}) },
                     body: JSON.stringify({ keyword: '晴天', limit: 3 }),
                   });
-                  lines.push(`HTTP ${res.status}`);
-                  const txt = await res.text(); lines.push(txt.slice(0, 800));
-                  try { const j = JSON.parse(txt); lines.push(`---\ncode=${j.code}  songs=${j?.result?.songs?.length ?? 'N/A'}`); } catch {}
+                  lines.push(`[搜歌] HTTP ${res.status}${res.headers.get('X-Sully-Cache') ? ` · cache=${res.headers.get('X-Sully-Cache')}` : ''}`);
+                  const txt = await res.text();
+                  let firstSongId: number | null = null;
+                  try {
+                    const j = JSON.parse(txt);
+                    firstSongId = j?.result?.songs?.[0]?.id ?? null;
+                    lines.push(`code=${j.code}  songs=${j?.result?.songs?.length ?? 'N/A'}`);
+                  } catch {
+                    lines.push(txt.slice(0, 300));
+                  }
+                  const testId = firstSongId || 186016;
+                  const urlRes = await fetch(`${effectiveWorkerUrl}/netease/song/url`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', ...(ck ? { 'X-Netease-Cookie': ck } : {}) },
+                    body: JSON.stringify({ ids: [testId], level: cfg.quality }),
+                  });
+                  lines.push(`[播放直链 #${testId}] HTTP ${urlRes.status}${urlRes.headers.get('X-Sully-Cache') ? ` · cache=${urlRes.headers.get('X-Sully-Cache')}` : ''}${urlRes.headers.get('X-Sully-Upstream') ? ` · upstream=${urlRes.headers.get('X-Sully-Upstream')}` : ''}`);
+                  const urlTxt = await urlRes.text();
+                  try {
+                    const uj = JSON.parse(urlTxt);
+                    const item = uj?.data?.[0];
+                    if (urlRes.ok && item) {
+                      lines.push(`code=${uj.code}  hasUrl=${!!item.url}  br=${item.br || 0}  trial=${!!item.freeTrialInfo}`);
+                    } else {
+                      lines.push(urlTxt.slice(0, 400));
+                    }
+                  } catch {
+                    lines.push(urlTxt.slice(0, 400));
+                  }
                 } catch (e: any) { lines.push(`异常: ${e.message}`); }
                 alert(lines.join('\n'));
               }}
@@ -742,3 +771,5 @@ const MusicApp: React.FC = () => {
 };
 
 export default MusicApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

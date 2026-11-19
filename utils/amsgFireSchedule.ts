@@ -31,7 +31,7 @@ export const AMSG_FIRE_RENEW_TOOL = 'renew_active_message';
 export const MAX_FIRE_SCHEDULES = 2;
 
 /**
- * 防穿帮策略的说明，前台工具和 fire 侧共用这一份。
+ * 到点策略的说明，前台工具和 fire 侧共用这一份。
  *
  * 分界线不是「谁提的」，是「到点要说的是一件具体的事，还是只是想找话说」：
  * 想找话说的，用户人回来了就该让路；许过的具体承诺（不管是用户要求的还是角色自己说的），
@@ -39,21 +39,34 @@ export const MAX_FIRE_SCHEDULES = 2;
  * 许下的承诺挡在外面了——「汤炖上了两小时后叫你」会被判成该让路，然后再没人提起。
  */
 export const EXPIRE_POLICY_DESCRIPTION = [
-  '防穿帮策略。',
-  'expire（默认，大多数情况用它）：到点时如果排程之后对话已有新进展、或用户此刻正在聊天，这条自动作废——之后你会在排程现状里看到，由你决定自然带出、续期还是放弃。',
+  '到点策略。',
+  'expire（默认，大多数情况用它）：到点时你会先看一眼最新的对话再开口——这件事已经聊过了、或者插进来会打断正在说的事，这次就不发；没发的之后你会在排程现状里看到，由你决定自然带出、续期还是放弃。',
   '挑话题、想找人聊天这类「想说点什么」的排程一律用它：用户人都回来了，你还照着几小时前的想法开口，会很假。',
-  'force：不管用户在不在聊天都照发。用在「到那个点必须说这件具体的事」上，两种来源都算——用户明确要求的（如"8点叫我起床"），以及你自己许下的（如"汤炖上了，两小时后好了叫你""你那个会我到点提醒你"）。',
+  'force：准点照发，不等也不让。用在「到那个点必须说这件具体的事」上，两种来源都算——用户明确要求的（如"8点叫我起床"），以及你自己许下的（如"汤炖上了，两小时后好了叫你""你那个会我到点提醒你"）。',
   '这类兑现的是一个具体承诺，用户中途回来聊过天也不影响它该响。',
 ].join('\n');
 
-/** fire 侧的工具描述：比前台那份多两句「你现在正在发消息」的语境。 */
-const FIRE_TOOL_DESCRIPTION = [
-  '给自己排下一条主动消息：到指定时间后你会再根据那时的上下文生成一条推送给用户。',
-  '你现在正在发一条主动消息，这个工具让你把话接着往下说——比如这条先说一半，过一两个小时再接上去；或者你说了要去做某件事，做完的时间点回来告诉用户。',
+/** 即时对话与本地聊天都是在回复用户，与定时触发「正在发主动消息」分开措辞。 */
+const buildScheduleToolDescription = (context: 'chat' | 'fire', maxActiveTasks?: number) => [
+  ...(context === 'chat'
+    ? [
+      '创建定时主动消息：到指定时间后，你会根据最新聊天上下文生成并推送消息给用户。',
+      '正在聊天时，你也可以因为惦记、想分享自己的生活、兑现承诺，给未来的自己排一次联系，不必等用户明确要求。',
+    ]
+    : [
+      '给自己排下一条主动消息：到指定时间后你会再根据那时的上下文生成一条推送给用户。',
+      '你现在正在发一条主动消息，这个工具让你把话接着往下说——比如这条先说一半，过一两个小时再接上去；或者你说了要去做某件事，做完的时间点回来告诉用户。',
+    ]),
   '排下的这条到点时会知道你这次说了什么，能接得上，不用在参数里复述。',
   'send_at 是开始生成的时间，不是送达时间（生成有十几秒延迟），且必须至少比现在晚 1 分钟。',
-  `一次最多排 ${MAX_FIRE_SCHEDULES} 条；每个角色同时挂的任务也有上限，排不下时会告诉你。`,
-  '没有「接着说」的必要就别排——为了排而排出来的后续，用户读起来就是没话找话。',
+  `一次最多排 ${MAX_FIRE_SCHEDULES} 条；${
+    typeof maxActiveTasks === 'number' && Number.isFinite(maxActiveTasks)
+      ? `每个角色最多同时挂 ${maxActiveTasks} 个任务`
+      : '每个角色同时挂的任务也有上限'
+  }，排不下时会告诉你。`,
+  context === 'chat'
+    ? '未来那个时刻真的想联系就排，尊重用户的生活和「别打扰」，不要为了排而排。'
+    : '没有「接着说」的必要就别排——为了排而排出来的后续，用户读起来就是没话找话。',
 ].join('\n');
 
 export interface FireScheduleToolDef {
@@ -125,12 +138,16 @@ const buildParameters = (example: string, abilities: SelfScheduleAbilities) => b
 });
 
 export const buildFireScheduleTool = (
-  opts: FireScheduleTimeOpts & { abilities: SelfScheduleAbilities },
+  opts: FireScheduleTimeOpts & {
+    abilities: SelfScheduleAbilities;
+    context?: 'chat' | 'fire';
+    maxActiveTasks?: number;
+  },
 ): FireScheduleToolDef => ({
   type: 'function',
   function: {
     name: AMSG_FIRE_SCHEDULE_TOOL,
-    description: FIRE_TOOL_DESCRIPTION,
+    description: buildScheduleToolDescription(opts.context ?? 'fire', opts.maxActiveTasks),
     parameters: buildParameters(
       buildSendAtExample(opts.nowMs, opts.tz),
       opts.abilities,
@@ -139,8 +156,7 @@ export const buildFireScheduleTool = (
 });
 
 /**
- * fire 侧的取消 / 改期工具声明。参数语义与前台同名工具一致（task_id 短 id、
- * send_at 裸墙钟），描述按 fire 语境（「你正在发消息」）微调。
+ * 取消 / 改期工具声明，前台聊天与后台 fire 共用同一套参数与描述。
  */
 export const buildFireCancelTool = (): FireScheduleToolDef => ({
   type: 'function',
@@ -166,7 +182,7 @@ export const buildFireRenewTool = (opts: FireScheduleTimeOpts): FireScheduleTool
     name: AMSG_FIRE_RENEW_TOOL,
     description: [
       '给你挂着的一个任务改触发时间：只换时间，沿用原有模式与提示方向。',
-      '一次性任务 = 整条改到新时间（编号不变）；循环任务 = 只给这一次补发一条一次性任务，原来的每天/每周节奏不动。',
+      '一次性任务 = 整条改到新时间；循环任务 = 只给这一次补发一条一次性任务，原来的每天/每周节奏不动。',
       '想改的是循环任务本身的时间、或者想说的内容方向已经变了，改用 cancel_active_message + schedule_active_message 重新创建。',
       `send_at 至少比现在晚 1 分钟（写你本地的墙钟时间，如 ${buildSendAtExample(opts.nowMs, opts.tz)}，不带时区后缀）。`,
     ].join('\n'),
@@ -182,6 +198,23 @@ export const buildFireRenewTool = (opts: FireScheduleTimeOpts): FireScheduleTool
 });
 
 /**
+ * 本地聊天与即时对话共用的自主联系说明。放在纯拼文案模块里，Worker 不依赖本地台账。
+ * 即使没有待触发任务也要提供；工具签名只教怎么排，这里教角色什么时候会想排。
+ */
+export const buildAmsg2ChatScheduleBrief = (targetName?: string): string => {
+  const target = targetName?.trim() || '对方';
+  return [
+    `你和${target}的联系不只发生在正在聊天的时候。你就是那个在各自生活继续往前时，仍会再次想起${target}的人。当你能预见：到了未来某个时刻，你会因为惦记、想分享、兑现承诺，或自己的生活有了新进展而自然想联系${target}，就用 schedule_active_message 把那次联系排下来。到点后你会带着最新上下文，以那一刻的自己重新开口，不是照着预写台词完成提醒。`,
+    `- ${target}接下来顾不上手机时——睡觉、上课、上班、打游戏、洗澡、出门，或任何你了解的原因——你可以在途中想到ta，也可以估着ta回来时再联系。`,
+    `- 内容不必总围着${target}转。结合刚才的聊天氛围、你自己的日程和正在经历的事、刚看到的细节和突然冒出的后续念头；分享自己的生活，往往比机械问候更像你。`,
+    '- 「到点叫你」「等你忙完跟你说」「回头告诉你结果」这类话一说出口，就当场排成真任务，不要只在正文里答应；没排成，就别把承诺说死。',
+    `- 只问自己：那个时刻的你会真的想联系${target}吗？会就排；只是随口一想、到时候未必真有话说的，就算了。也别为了显得贴心硬排。`,
+    `- 时间贴着${target}的生活估；一局游戏和睡到天亮不是一个时长，有时差就按ta那边的钟算。`,
+    `- ${target}明确说别打扰时就安静等；已经排着相近的一条，也别重复排。`,
+  ].join('\n');
+};
+
+/**
  * 拼进 prompt 的说明块。
  *
  * native 模式只说「有这么个能力、什么时候用」——工具签名已随请求声明，再教一遍正文语法
@@ -191,6 +224,9 @@ export const buildFireRenewTool = (opts: FireScheduleTimeOpts): FireScheduleTool
 export const buildFireScheduleBlock = (
   mode: 'native' | 'text',
   opts: FireScheduleTimeOpts & {
+    /** 普通聊天用共用的自主联系说明；定时触发保留「发完再接着说」语境。 */
+    context?: 'chat' | 'fire';
+    targetName?: string;
     /** 「用户给你定的规矩」那一段（amsgLimits.buildLimitsBrief），接在块尾。 */
     limitsBrief?: string;
   },
@@ -204,13 +240,19 @@ export const buildFireScheduleBlock = (
     '',
     '---',
     '【你可以给自己排下一条】',
-    '这条消息发完，如果还有话要在之后某个时间点说（把没说完的接上去、或者去做的事做完了回来告诉他），',
-    '可以现在就把那一条排好——不需要用户在线，到点会自动发出去，而且那时你会知道自己这次说了什么。',
+    ...(opts.context === 'chat'
+      ? [buildAmsg2ChatScheduleBrief(opts.targetName)]
+      : [
+        '这条消息发完，如果还有话要在之后某个时间点说（把没说完的接上去、或者去做的事做完了回来告诉他），',
+        '可以现在就把那一条排好——不需要用户在线，到点会自动发出去，而且那时你会知道自己这次说了什么。',
+      ]),
     howTo,
     // 角色在 prompt 里只看得到自己那边的钟，很容易把「晚上聊两句」排到对方的凌晨三点。
     // 对方那边此刻几点写在【当前时刻补充】里（有时差时才有那一行）。
-    '定时间之前先想想对方那边是几点：你们之间可能有时差，别把消息排到对方的深夜。',
-    '没必要就别排。为了排而排出来的后续，读起来就是没话找话。',
+    ...(opts.context === 'chat' ? [] : [
+      '定时间之前先想想对方那边是几点：你们之间可能有时差，别把消息排到对方的深夜。',
+      '没必要就别排。为了排而排出来的后续，读起来就是没话找话。',
+    ]),
     ...(opts.limitsBrief ? [opts.limitsBrief] : []),
   ].join('\n');
 };
@@ -237,6 +279,38 @@ export const buildTaskInstruction = (mode: ActiveMsg2Mode, promptHint?: string):
     promptHint?.trim() ? `可选灵感补充：${promptHint.trim()}` : '可选灵感补充：无',
   ].join('\n');
 };
+
+// ─── 离开后消息 ───
+// 每个角色最多一条云端任务：对方开口后往后推到「最后一次开口 + 等待时长」，到点前对方
+// 又说过话就由 worker 原地推迟（见 worker onBeforeFire）。到点必发，不给角色选择不说。
+
+/** 任务 metadata 上的标记与等待时长（分钟）。worker 认这两个键。 */
+export const AMSG_AWAY_MESSAGE_META = 'amsgAwayMessage';
+export const AMSG_AWAY_DELAY_META = 'amsgAwayDelayMinutes';
+
+export const buildAwayTaskInstruction = (delayMinutes: number): string => [
+  `对方已经超过 ${delayMinutes} 分钟没跟你说话了，这次是你主动去找对方。`,
+  '这次一定要发出消息：结合你们最后聊到哪儿、对方离开了多久、你自己这会儿在做什么，像真人一样自然地发一到三句私聊。',
+  '可以惦记对方去哪了、分享你刚经历的事，或者接上没聊完的话；不要像系统提醒，也不要提「多少分钟」这种计时。',
+].join('\n');
+
+// ─── 见面离开提醒 ───
+// 见面对话中途走开，过了用户设定的时长，角色在私聊里找对方一次（见 docs/date-leave-reminder.md）。
+// 任务在进入见面对话时就建好；人还在见面里（「见面中」租约在续）时 worker 把它推到「最后
+// 一次见到人 + 等待时长」，人一走开租约不再续，到点就发。走开那一刻客户端什么都不用做，
+// 切到后台后脚本被冻住也不影响。
+// 到点必发；不受连发和每日上限拦、这一轮不给排程工具：它一次离开只发一条，带不出后续。
+
+/** 任务 metadata 上的标记与等待时长（分钟）。worker 认这两个键。 */
+export const AMSG_DATE_LEAVE_META = 'amsgDateLeave';
+export const AMSG_DATE_LEAVE_DELAY_META = 'amsgDateLeaveDelayMinutes';
+
+/** 云端任务指令和本地提示共用这一段，两条路说的是同一件事。 */
+export const buildDateLeaveInstruction = (): string => [
+  '你们刚才正在线下见面，聊到一半对方忽然走开了，到现在还没回来。你拿起手机，主动给对方发私聊找人。',
+  '这次一定要发出消息：接着刚才见面时的气氛和你们聊到的地方，像真人一样自然地发一到三句。',
+  '可以问对方去哪了、是不是临时有事，说你还在等、或者先去做点别的；按你的人设和你们的关系来，不要像系统提醒，也不要提「多少分钟」这种计时。',
+].join('\n');
 
 // ─── send_at 的时间参照系 ───
 //
@@ -497,7 +571,9 @@ export const extractFireScheduleTextCalls = (content: string): FireScheduleTextC
   if (!content) return [];
   const re = new RegExp(`(^|[^\\w./])${escapeRegExp(AMSG_FIRE_SCHEDULE_TOOL)}\\s*\\(([^)]*)\\)`, 'g');
   const calls: FireScheduleTextCall[] = [];
-  for (const m of content.matchAll(re)) {
+  // 文档示例和行内代码不是执行意图，保留原文给用户看。
+  const executable = content.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`/g, match => ' '.repeat(match.length));
+  for (const m of executable.matchAll(re)) {
     const matched = m[0].slice(m[1].length);
     let args: Record<string, unknown> = {};
     try {

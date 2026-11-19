@@ -1,3 +1,5 @@
+import { isChatConversationEntry } from './trace';
+
 import { readMaintenanceSettings } from './maintenanceMode';
 import { loadRangeMessageContents } from './rangeMessagePage';
 import { loadCharacterContextMessages } from '../chatContextRange';
@@ -276,12 +278,13 @@ export function mergePalaceFragmentsIntoMemories(
     }
 
     for (const frag of incoming) {
+        if (result.some(memory => memory.id === frag.id)) continue;
         if (frag.palaceMemoryId) {
             // Never merge a new link into a pre-upgrade daily snapshot, even on the same date.
             if (!result.some(memory => memory.palaceMemoryId === frag.palaceMemoryId)) result.push(frag);
             continue;
         }
-        const existingIdx = palaceByDate.get(frag.date);
+        const existingIdx = frag.mood === 'palace' ? palaceByDate.get(frag.date) : undefined;
         if (existingIdx !== undefined) {
             // merge：把新 bullets 直接追加到 summary。
             // 不做字符串去重——LLM 偶尔写出相同短句的合法情况会被误杀，
@@ -296,7 +299,7 @@ export function mergePalaceFragmentsIntoMemories(
             };
         } else {
             result.push(frag);
-            palaceByDate.set(frag.date, result.length - 1);
+            if (frag.mood === 'palace') palaceByDate.set(frag.date, result.length - 1);
         }
     }
 
@@ -377,6 +380,8 @@ export interface RecallRetrievalOptions {
     recallPlan?: RecallPlan;
     /** 调用方专用的最终召回/格式化上限；默认聊天仍保持 15。 */
     formatterMaxOutputItems?: number;
+    /** 隐去召回结果上的现实日期与「今天/距今X天」标注（用于虚构剧场与关掉线下时间感知的见面）。 */
+    omitDates?: boolean;
 }
 
 export async function retrieveMemories(
@@ -1109,7 +1114,7 @@ export async function retrieveMemories(
         const anticipations = await tRetrieve('AnticipationDB.getByCharId', 'IDB', AnticipationDB.getByCharId(charId));
 
         // 10. 格式化
-        const formatted = await tRetrieve('expandAndFormat', 'IDB', expandAndFormat(results, charId, anticipations, userName, formatterCap));
+        const formatted = await tRetrieve('expandAndFormat', 'IDB', expandAndFormat(results, charId, anticipations, userName, formatterCap, { omitDates: recallOptions?.omitDates }));
 
         // ── 汇总打印 ──
         const perfTotal = Math.round(performance.now() - perfRetrieveT0);
@@ -1177,7 +1182,7 @@ export async function injectMemoryPalace(
     recentMessages?: Message[],
     queryHint?: string,
     userName?: string,
-    traceContext?: { entryPoint?: RecallEntryPoint; formatterMaxOutputItems?: number },
+    traceContext?: { entryPoint?: RecallEntryPoint; formatterMaxOutputItems?: number; omitDates?: boolean },
 ): Promise<RecallTrace> {
     const hadPreviousMemory = Boolean(char.memoryPalaceInjection);
     const hadPreviousRoomPlates = Boolean(char.roomPlatesInjection);
@@ -1209,7 +1214,17 @@ export async function injectMemoryPalace(
     }
 
     let explicitEntityAnalysis: ExplicitEntityAnalysis | undefined;
-    const interactiveRecall = trace.entryPoint === 'chat_app' || trace.entryPoint === 'collaboration';
+    const proactiveRecall = trace.entryPoint === 'proactive_chat';
+    const interactiveRecall = isChatConversationEntry(trace.entryPoint) || trace.entryPoint === 'collaboration' || proactiveRecall;
+    // 主动消息通常在角色已经回复后打包。只为分析回看最后一轮真实用户发言；
+    // 检索和最终历史仍使用完整可见范围，不丢掉角色回复，也不回读水位线外原文。
+    let analysisMessages = recentMessages || [];
+    if (proactiveRecall) {
+        let end = analysisMessages.length - 1;
+        while (end >= 0 && (analysisMessages[end].role !== 'user'
+            || analysisMessages[end].metadata?.proactiveHint)) end -= 1;
+        analysisMessages = analysisMessages.slice(0, end + 1);
+    }
     if (!trace.featureFlagsSnapshot.recallRouter) {
         trace.explicitEntityRecall = { status: 'disabled' };
         trace.eventBoxMetadataRecall = { status: 'disabled' };
@@ -1221,7 +1236,7 @@ export async function injectMemoryPalace(
     } else {
         trace.eventBoxMetadataRecall = { status: 'no_query' };
         const explicitStartedAt = performance.now();
-        explicitEntityAnalysis = analyzeExplicitEntitySignals(recentMessages || [], char.name, userName);
+        explicitEntityAnalysis = analyzeExplicitEntitySignals(analysisMessages, char.name, userName);
         trace.stages.push({
             name: 'explicit_signal',
             durationMs: Math.round(performance.now() - explicitStartedAt),
@@ -1240,7 +1255,7 @@ export async function injectMemoryPalace(
 
         const analyzerStartedAt = performance.now();
         const analysis = analyzeLocalContext(
-            recentMessages || [],
+            analysisMessages,
             char.name,
             userName,
             explicitEntityAnalysis.hasSignals,
@@ -1273,7 +1288,7 @@ export async function injectMemoryPalace(
     } else {
         const interactionStartedAt = performance.now();
         const interaction = analyzeUserInteraction(
-            recentMessages || [],
+            analysisMessages,
             char.interactionAccommodation,
             char.name,
             userName,
@@ -1306,14 +1321,14 @@ export async function injectMemoryPalace(
         let depth: ReturnType<typeof analyzeDeepEngagement> | ReturnType<typeof analyzeConversationEngagement>;
         try {
             depth = legacyRequested
-                ? analyzeDeepEngagement(recentMessages || [], char.name, userName)
-                : analyzeConversationEngagement(char.id, recentMessages || [], char.name, userName);
+                ? analyzeDeepEngagement(analysisMessages, char.name, userName)
+                : analyzeConversationEngagement(char.id, analysisMessages, char.name, userName, { persist: !proactiveRecall });
         } catch (error) {
             // M3 是质量增强层。v2 状态损坏或边界输入出错时，当轮回退旧分析，不能阻断聊天。
             console.warn('[ConversationEngagement] v2 failed, falling back to legacy depth:', error);
-            clearConversationEngagementState(char.id);
+            if (!proactiveRecall) clearConversationEngagementState(char.id);
             engine = 'legacy_depth';
-            depth = analyzeDeepEngagement(recentMessages || [], char.name, userName);
+            depth = analyzeDeepEngagement(analysisMessages, char.name, userName);
         }
         trace.deepEngagement = {
             status: depth.analyzable ? 'observed' : 'no_signal',
@@ -1351,6 +1366,32 @@ export async function injectMemoryPalace(
         trace.stages.push({ name: 'finalize', durationMs: 0, outcome: 'skipped' });
         return finishRecallTrace(trace, 'skipped_palace_disabled');
     }
+    // 调用方没显式传 userName 时，兜底从全局用户档案取，保证各入口
+    // （群聊/通话/事件/学习等）召回的房间名都统一显示「{用户名}的房间」，
+    // 而不是回退成「用户房间」。
+    let resolvedUserName = userName;
+    if (!resolvedUserName) {
+        try { resolvedUserName = (await DB.getUserProfile())?.name || undefined; } catch {}
+    }
+
+    // 门牌（常驻语义层）：纯 IDB 读 + 格式化，不调 LLM。
+    // 无条件赋值（包括 ''）—— 门牌被清空/删除后，persist 过的旧注入必须被冲掉。
+    const roomPlatesStartedAt = performance.now();
+    let roomPlateOutcome: RecallTraceStage['outcome'] = 'ok';
+    try {
+        const { buildRoomPlatesInjection } = await import('./roomPlates');
+        char.roomPlatesInjection = await buildRoomPlatesInjection(char.id, resolvedUserName);
+    } catch {
+        char.roomPlatesInjection = '';
+        roomPlateOutcome = 'error';
+    }
+    trace.injection.roomPlateChars = char.roomPlatesInjection.length;
+    trace.stages.push({
+        name: 'room_plates',
+        durationMs: Math.round(performance.now() - roomPlatesStartedAt),
+        outcome: roomPlateOutcome,
+    });
+
     const embeddingConfig = getEmbeddingConfig(char.embeddingConfig);
     if (!embeddingConfig) {
         trace.stages.push({ name: 'finalize', durationMs: 0, outcome: 'skipped' });
@@ -1365,32 +1406,6 @@ export async function injectMemoryPalace(
             outcome: 'ok',
         });
         const currentMood = char.activeBuffs?.[0]?.name;
-        // 调用方没显式传 userName 时，兜底从全局用户档案取，保证各入口
-        // （群聊/通话/事件/学习等）召回的房间名都统一显示「{用户名}的房间」，
-        // 而不是回退成「用户房间」。
-        let resolvedUserName = userName;
-        if (!resolvedUserName) {
-            try { resolvedUserName = (await DB.getUserProfile())?.name || undefined; } catch {}
-        }
-
-        // 门牌（常驻语义层）：纯 IDB 读 + 格式化，不调 LLM。
-        // 无条件赋值（包括 ''）—— 门牌被清空/删除后，persist 过的旧注入必须被冲掉。
-        const roomPlatesStartedAt = performance.now();
-        let roomPlateOutcome: RecallTraceStage['outcome'] = 'ok';
-        try {
-            const { buildRoomPlatesInjection } = await import('./roomPlates');
-            char.roomPlatesInjection = await buildRoomPlatesInjection(char.id, resolvedUserName);
-        } catch {
-            char.roomPlatesInjection = '';
-            roomPlateOutcome = 'error';
-        }
-        trace.injection.roomPlateChars = char.roomPlatesInjection.length;
-        trace.stages.push({
-            name: 'room_plates',
-            durationMs: Math.round(performance.now() - roomPlatesStartedAt),
-            outcome: roomPlateOutcome,
-        });
-
         const retrieveStartedAt = performance.now();
         let retrievalTelemetry: RecallRetrievalTelemetry | undefined;
         const context = await retrieveMemories(
@@ -1403,7 +1418,7 @@ export async function injectMemoryPalace(
             getRemoteVectorConfig(),
             char.name,
             telemetry => { retrievalTelemetry = telemetry; },
-            { explicitEntityAnalysis, formatterMaxOutputItems: traceContext?.formatterMaxOutputItems },
+            { explicitEntityAnalysis, formatterMaxOutputItems: traceContext?.formatterMaxOutputItems, omitDates: traceContext?.omitDates },
         );
         if (context || !legacyCompatibilityMode) {
             char.memoryPalaceInjection = context || '';
@@ -2090,7 +2105,7 @@ export async function processNewMessages(
         // 1. 加载全部消息（含已处理的），计算热区和缓冲区
         //    过滤：保留任何有语义的消息类型（文字、带转写的语音、卡片、系统事件等），
         //    只排除纯视觉资源和无转写的纯音频，避免 URL / base64 污染 LLM。
-        const allMessages = await DB.getMessagesByCharId(charId, true);
+        const allMessages = await DB.getMessagesByCharId(charId, true, options.drainBuffer === true);
         const privateMessages = allMessages
             .filter(message => !message.groupId)
             .sort((a, b) => a.id - b.id);
@@ -2193,7 +2208,7 @@ export async function processNewMessages(
         //       消息不会被重复处理，去重在这条路径上收益小、误伤大。
         const core = await extractAndStoreMemories(
             toProcess, charId, charName, embeddingConfig, llmConfig, userName, onProgress, true,
-            options.requireAllBatches === true,
+            true, // A failed batch must never be hidden by another batch's successful waterline advance.
         );
 
         if (core.memories.length === 0) {

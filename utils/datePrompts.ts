@@ -6,12 +6,12 @@
  *
  * 与聊天侧注入面的差异（刻意为之，不是漏配）：
  *   - 注入：ContextBuilder.buildCoreContext 全量（人设 / 世界书 / 印象 / 记忆 /
- *     记忆宫殿召回 / 情绪 buff）+ 当前虚拟时间。
+ *     记忆宫殿召回 / 已开启的日程）+ 当前虚拟时间；情绪上下文不在此入口启用。
  *   - 不注入：聊天 App 行为规范（IM 气泡 / 表情包 / 语音 / 引用 / 转账 / 小红书 /
  *     日记等工具块）——这些是线上聊天专属指令，面对面场景里输出会破坏 VN 格式。
  *   - 不注入：实时天气 / 新闻、群聊背景、Notion / 飞书日记标题——见面是高沉浸短会话，
  *     这些背景块收益低，还会稀释 VN 格式指令的权重。
- *   - 日程 / 音乐氛围目前也不进见面场景；以后要加请在这里统一加，别在组件里散拼。
+ *   - 日程由 ContextBuilder 统一读取，所有入口遵守角色总开关；音乐氛围仍为私聊额外内容。
  *   - 角色表达原则与 ChatApp 共用；三条路径均在世界书和模式指令之后追加 system 收尾。
  *     收尾不参与世界书关键词扫描或对话深度计数，也不按模型供应商分流。
  *
@@ -25,9 +25,22 @@ import { ContextBuilder } from './context';
 import { ChatPrompts } from './chatPrompts';
 import { injectMemoryPalace } from './memoryPalace/pipeline';
 import { resolveCharTimeZone, nowInTimeZone } from './timezone';
-import { getVoicePromptOverride } from './ttsProvider';
+import { getElevenLabsModel, getTtsProvider, getVoicePromptOverride } from './ttsProvider';
+import { getElevenLabsVoiceActingGuide } from './elevenLabsTts';
+import { isElevenLabsV4Model } from './elevenLabsModels';
 import { selectCharacterContextMessages } from './chatContextRange';
 import { buildCharacterResponsePrinciples } from './characterResponsePrinciples';
+import { voiceLanguagePromptLabel } from './voiceLanguage';
+import { resolveCharacterUser } from './userPersona';
+
+const buildDateVoiceTranslationGuide = (char: CharacterProfile): string => {
+    if (!char.dateVoiceEnabled || !char.dateVoiceLang) return '';
+    return `### 见面语音译文（与正文在同一次回复中生成）
+正文仍按原来的语言、台词与叙述格式输出。在每一行正文末尾追加 <date-voice lang="${char.dateVoiceLang}">该行的${voiceLanguagePromptLabel(char.dateVoiceLang)}译文</date-voice>，不要另起一行。
+台词行只翻译台词，叙述行翻译该行叙述，逐行对应，不省略、不新增情节。译文不要添加立绘标签或 [v:xxx]；声音 Audio Tags 与 /IPA/ 指令原样保留。OBSERVE 观测块及其他系统指令不加译文。译文只是朗读用，不是角色又说了一遍。
+示例结构：[happy] "原文台词。" [v:calm] <date-voice lang="${char.dateVoiceLang}">对应的目标语言台词。</date-voice>
+即使历史消息没有译文，本次也须按以上格式同步输出。`;
+};
 
 /** Adapted from story preset character-polyphony / evidence-gate / user-agency.
  * In-person companionship permits a small beat; it does not require plot escalation.
@@ -56,6 +69,13 @@ export const DATE_VOICE_GUIDE = `4. **语音情绪（跟立绘分开）**: \`[em
    - 不是每句都要标——情绪平淡、自然说话时**不标**（默认更真实），只在台词确实有明显情绪、且和立绘强度不一致时才标。
    - 立绘可以夸张、语音要克制。例：\`[happy] "……真的吗？我等这句话好久了。" [v:calm]\`（脸上是惊喜，声音是压着的温柔）。
    - \`[v:xxx]\` 只写在带引号的台词行，动作/叙述行不用标。`;
+
+export const getDateVoiceGuide = (provider = getTtsProvider(), model = getElevenLabsModel()): string => {
+    const custom = getVoicePromptOverride('dateVoice');
+    if (custom) return custom;
+    if (provider !== 'elevenlabs' || !isElevenLabsV4Model(model)) return DATE_VOICE_GUIDE;
+    return `${DATE_VOICE_GUIDE}\n\n${getElevenLabsVoiceActingGuide(model)}\n\n见面格式约定：Audio Tags 放在台词引号内部，行首仍只写立绘表情，行尾仍可写独立的 [v:xxx]。上面的情绪标签枚举限制只针对行首立绘标签，不限制引号内部的声音指令。例如：[shy] "[whispers] 你终于来了。[soft chuckle]" [v:calm]。动作与叙述行保持原格式，不加语音标签。`;
+};
 
 /**
  * 注入 prompt 的当前时间，直接取真实系统时间（完整日期 + 星期 + 时分）。
@@ -597,7 +617,8 @@ const buildVNModeBlock = (char: CharacterProfile, userName: string): string => {
 1. **禁止混写**: 严禁在同一行里既写动作又写带引号的台词。
 2. **情绪标签**: **每一行都必须以** \`[emotion]\` **开头**，表示该行的表情立绘。逐行结合台词、动作和上下文选择最贴切的表情，细微情绪也要体现；[normal] 用于确实平静或中性的状态，不是默认占位符。已有笑意、低落、恼意或羞赧时，应从可用标签中选对应表情，不要把明确情绪全标成 [normal]。同一情绪延续时，相邻行可以重复标签；情绪发生变化时及时切换，不为了凑标签种类制造情绪。仅限使用以下情绪: ${dateEmotions.join(', ')}。不要使用任何不在此列表中的标签。
 3. **格式**: 台词用双引号 **"..."**，动作/叙述直接写（不加引号）。
-${char.dateVoiceEnabled ? (getVoicePromptOverride('dateVoice') ?? DATE_VOICE_GUIDE) : ''}
+${char.dateVoiceEnabled ? getDateVoiceGuide() : ''}
+${buildDateVoiceTranslationGuide(char)}
 
 ${preset.block}
 
@@ -630,7 +651,7 @@ const buildDateHistory = (
         userProfile || ({} as UserProfile),
         emojis,
         undefined,
-        { useVisionDescriptions },
+        { useVisionDescriptions, timeAwarenessEnabled: isDateTimeAwarenessOn(char) },
     );
     return apiMessages;
 };
@@ -643,21 +664,23 @@ export const DatePrompts = {
      * 历史以纯文本块塞进 user 消息（保持"你不在和用户对话"的框定），
      * 但文本本身来自 buildMessageHistory，卡片/媒体已压成短摘要。
      */
-    buildPeekPayload: (input: {
+    buildPeekPayload: async (input: {
         char: CharacterProfile;
         userProfile: UserProfile;
         allMsgs: Message[];
         emojis: Emoji[];
         useVisionDescriptions?: boolean;
         openingMode?: 'approach' | 'invite';
-    }): { messages: ApiMessage[] } => {
-        const { char, userProfile, allMsgs, emojis } = input;
+    }): Promise<{ messages: ApiMessage[] }> => {
+
+        const { char, allMsgs, emojis } = input;
+        const userProfile = resolveCharacterUser(input.userProfile, char);
         const charTz = resolveCharTimeZone(char);
         const dateTimeOn = isDateTimeAwarenessOn(char);
-        const timeStr = getRealTimeStr(charTz);
+        const timeStr = dateTimeOn ? getRealTimeStr(charTz) : '';
         const selected = selectCharacterContextMessages(allMsgs, char);
         const lastMsg = allMsgs[allMsgs.length - 1];
-        const gapHint = getTimeGapHint(lastMsg?.timestamp, charTz);
+        const gapHint = dateTimeOn ? getTimeGapHint(lastMsg?.timestamp, charTz) : '';
 
         const { apiMessages } = ChatPrompts.buildMessageHistory(
             selected,
@@ -666,34 +689,42 @@ export const DatePrompts = {
             userProfile || ({} as UserProfile),
             emojis,
             undefined,
-            { useVisionDescriptions: input.useVisionDescriptions === true },
+            {
+                useVisionDescriptions: input.useVisionDescriptions === true,
+                timeAwarenessEnabled: dateTimeOn,
+            },
         );
 
         // 线下时间感知关掉 → 抑制 buildCoreContext 的时间注入，让见面真正脱离现实时间线（纯架空）
         // conversational 不给：peek 是「用户还没走过去」的第三人称镜头，时间块末尾那句
         // 语境框定说的是「对方还在跟你说话」，跟这里的框定正好相反（见下面的 peekInstructions）。
-        const context = ContextBuilder.buildCharacterContext({
+        const context = (await ContextBuilder.buildCharacterContext({
             char, user: userProfile,
             history: apiMessages.map(message => ({ ...message, content: typeof message.content === 'string'
                 ? message.content : message.content.filter((part: any) => part?.type === 'text').map((part: any) => part.text).join(' ') })),
             includeDetailedMemories: false,
-            timeOptions: { skipTimeAwareness: !isDateTimeAwarenessOn(char) },
-        });
+            timeOptions: { skipTimeAwareness: !isDateTimeAwarenessOn(char), includeUserLocation: true },
+        }));
 
         // 文风预设也作用于开场感知；人称（pov）刻意不作用——peek 的设计就是
         // 第三人称旁观镜头（用户还没"走过去"），人称指令只影响 session 内叙述
         const preset = getStylePreset(char.dateStyleConfig);
         const extraBlock = buildExtraStyleBlock(char.dateStyleConfig);
 
-        // 根据时间间隔选择合适的分隔符
-        const contextSeparator = gapHint
-            ? `\n\n--- [TIME SKIP: ${gapHint}] ---\n\n`
-            : `\n\n--- [最近互动见上文，场景关系以具体上下文为准] ---\n\n`;
+        // 架空模式以剧情衔接，不用现实经过多久判断跳时，也不假定刚刚还在聊天。
+        const contextSeparator = !dateTimeOn
+            ? `\n\n--- [SCENE CONTINUATION: 按最近记录中的剧情时间与事件衔接] ---\n\n`
+            : gapHint
+                ? `\n\n--- [TIME SKIP: ${gapHint}] ---\n\n`
+                : `\n\n--- [最近互动见上文，场景关系以具体上下文为准] ---\n\n`;
+        const continuityRule = dateTimeOn
+            ? '参考 [最近记录]（注意消息来源标签：[聊天]是文字聊天、[约会]是面对面、[通话]是语音通话）。地点、正在做的事、话题是否延续，都以具体上下文为准；时间间隔只是参考。选择开场方式只决定谁主动靠近，不表示关系或话题重新开始，也不强制续接上一句话。'
+            : '参考 [最近记录]（注意消息来源标签：[聊天]是文字聊天、[约会]是面对面、[通话]是语音通话），沿用其中的剧情时间、地点、事件与情绪状态。时间推进以剧情明确内容为准。选择开场方式只决定谁主动靠近，不表示关系或话题重新开始，也不强制续接上一句话。';
 
         const invite = input.openingMode === 'invite';
         const peekInstructions = `
 ### 场景：感知 (Sense Presence)
-${dateTimeOn ? `当前时间: ${timeStr}\n` : ''}时间上下文: ${gapHint}
+${dateTimeOn ? `当前时间: ${timeStr}\n时间上下文: ${gapHint}\n` : ''}
 
 ### 任务
 ${invite ? `由你主动以合理的方式与 ${userProfile?.name || '对方'} 见面。根据已有上下文中的地点、约定、关系和你自己的动机，写出你如何走近或来到对方面前；如果已经在一起，就从当前场景自然靠近、开口，不另编一次到访。未知的地点或安排不要当成已知事实，也不代写用户答应、移动或回应。` : '你现在并不在和用户直接对话。用户正在悄悄靠近你所在的地点。'}
@@ -701,10 +732,11 @@ ${invite ? `由你主动以合理的方式与 ${userProfile?.name || '对方'} �
 ${invite ? '描写角色自己的到来、动作与必要的开场台词，停在留给用户回应的位置。' : `描述：${char.name} 此时此刻正在做什么？周围环境是怎样的？状态如何？`}
 
 ### 逻辑检查
-1. **上下文连贯性**: 参考 [最近记录]（注意消息来源标签：[聊天]是文字聊天、[约会]是面对面、[通话]是语音通话）。地点、正在做的事、话题是否延续，都以具体上下文为准；时间间隔只是参考。选择开场方式只决定谁主动靠近，不表示关系或话题重新开始，也不强制续接上一句话。
-2. **状态一致性**: ${gapHint.includes('天') ? '如果间隔了很多天，可能在发呆、忙碌或者有点落寞。' : '根据最近的聊天内容和情绪来决定当前状态。如果刚聊完，角色的状态应该与聊天内容相呼应。'}
+1. **上下文连贯性**: ${continuityRule}
+2. **状态一致性**: ${!dateTimeOn ? '根据最近记录中的剧情进展、场景与情绪来决定当前状态，使角色表现与上一幕自然呼应。' : gapHint.includes('天') ? '如果间隔了很多天，可能在发呆、忙碌或者有点落寞。' : '根据最近的聊天内容和情绪来决定当前状态。如果刚聊完，角色的状态应该与聊天内容相呼应。'}
 3. **描写风格**: ${preset.peekHint}。${isObserveOn(char) ? '先按下方「观测协议」输出观测块，再开始描写内容（描写本身不要加任何前缀）。' : '不要输出任何前缀，直接输出描写内容。'}
-${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlock(char)}` : ''}`;
+${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlock(char)}` : ''}
+${buildDateVoiceTranslationGuide(char)}`;
 
         return {
             messages: [
@@ -728,8 +760,12 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
         userText: string;
         variant: 'send' | 'reroll';
         useVisionDescriptions?: boolean;
+        /** 见面期间作废的主动消息（amsg2TaskContext.buildInPersonNoticesText），可提可不提。 */
+        inPersonNotes?: string | null;
     }): Promise<{ messages: ApiMessage[] }> => {
-        const { char, userProfile, allMsgs, emojis, userText, variant } = input;
+
+        const { char, allMsgs, emojis, userText, variant } = input;
+        const userProfile = resolveCharacterUser(input.userProfile, char);
 
         const historyMsgs = buildDateHistory(
             allMsgs,
@@ -741,12 +777,13 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
 
         const conversation = [...historyMsgs, { role: 'user', content: userText }];
 
+        const dateTimeOn = isDateTimeAwarenessOn(char);
         // 向量召回挂到 char.memoryPalaceInjection，buildCoreContext 会读取
-        await injectMemoryPalace(char, allMsgs, undefined, userProfile?.name);
-        const context = ContextBuilder.buildCharacterContext({
+        await injectMemoryPalace(char, allMsgs, undefined, userProfile?.name, { omitDates: !dateTimeOn });
+        const context = (await ContextBuilder.buildCharacterContext({
             char, user: userProfile, history: conversation,
-            timeOptions: { skipTimeAwareness: !isDateTimeAwarenessOn(char), conversational: true },
-        });
+            timeOptions: { skipTimeAwareness: !dateTimeOn, conversational: true, includeUserLocation: true },
+        }));
         const systemPrompt = context.coreContext
             + buildVNModeBlock(char, userProfile?.name || '')
             + ContextBuilder.buildSARModuleContext(char, userProfile, 'date');
@@ -766,6 +803,7 @@ ${extraBlock ? `\n${extraBlock}` : ''}${isObserveOn(char) ? `\n${buildObserveBlo
                 ...messagesWithWorldbooks.map(message => message === pendingMessage
                     ? { ...message, content: `${userText}\n\n${note}` }
                     : message),
+                ...(input.inPersonNotes ? [{ role: 'system', content: input.inPersonNotes }] : []),
                 { role: 'system', content: buildDateInteractionPrinciples(char.name, userProfile?.name || '对方') },
             ],
         };

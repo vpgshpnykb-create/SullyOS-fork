@@ -35,7 +35,7 @@ const THEMES: Record<ThemeMode, any> = {
         iconDone: 'text-green-500',
         decoLine: 'bg-slate-800',
         modalBg: 'bg-[#0f172a] border border-cyan-500',
-        input: 'bg-slate-800 text-white border-none rounded-none',
+        input: 'bg-slate-800 text-white [color-scheme:dark] placeholder:text-slate-400 border-none rounded-none',
         label: 'QUEST LOG',
         eventLabel: 'SERVER EVENTS'
     },
@@ -83,6 +83,7 @@ const ScheduleApp: React.FC = () => {
     const [tasks, setTasks] = useState<Task[]>([]);
     const [anniversaries, setAnniversaries] = useState<Anniversary[]>([]);
     const [activeTab, setActiveTab] = useState<'quest' | 'server_events'>('quest');
+    useAppShortcut(ShortcutAppID.Schedule, intent => setActiveTab(intent.entryId === 'server_events' ? 'server_events' : 'quest'));
     
     // Processing State for feedback
     const [processingTaskIds, setProcessingTaskIds] = useState<Set<string>>(new Set());
@@ -132,6 +133,7 @@ const ScheduleApp: React.FC = () => {
     // --- AI Logic ---
 
     const generateTaskReward = async (task: Task) => {
+
         const supervisor = characters.find(c => c.id === task.supervisorId);
         if (!supervisor || !apiConfig.apiKey) {
             addToast('任务已完成', 'success');
@@ -177,11 +179,18 @@ const ScheduleApp: React.FC = () => {
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: ContextBuilder.buildCharacterRequest(characterContextInput, messages),
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, messages)),
                     temperature: 0.9, 
                     max_tokens: 8000 
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'schedule',
+                    appName: '日程表',
+                    charId: supervisor.id,
+                    charName: supervisor.name,
+                    purpose: '待办完成反馈',
+                },
+            } as RequestInit);
 
             if (!response.ok) {
                 const errorText = await response.text();
@@ -219,6 +228,7 @@ const ScheduleApp: React.FC = () => {
     };
 
     const generateAnniversaryThought = async (anni: Anniversary) => {
+
         const char = characters.find(c => c.id === anni.charId);
         if (!char || !apiConfig.apiKey) return;
 
@@ -262,11 +272,18 @@ const ScheduleApp: React.FC = () => {
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: ContextBuilder.buildCharacterRequest(characterContextInput, messages),
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, messages)),
                     temperature: 0.8,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'schedule',
+                    appName: '日程表',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: '纪念日感想生成',
+                },
+            } as RequestInit);
 
             if (!response.ok) {
                  const errorText = await response.text();
@@ -571,7 +588,7 @@ const ScheduleApp: React.FC = () => {
                             {filterCharactersByGroup(characters, characterGroups, supervisorGroupId).map(c => (
                                 <button key={c.id} onClick={() => setNewTaskSupervisor(c.id)} className={`flex flex-col items-center gap-2 p-2 rounded-lg border transition-all min-w-[60px] ${newTaskSupervisor === c.id ? `${currentThemeMode === 'minimal' ? 'shadow-[inset_2px_2px_5px_#d1d9e6,inset_-2px_-2px_5px_#ffffff]' : 'border-current'}` : 'border-transparent opacity-50'}`}>
                                     <TokenImg value={c.avatar} className="w-10 h-10 rounded-md object-cover" />
-                                    <span className={`text-[10px] font-bold whitespace-nowrap ${theme.text}`}>{c.name}</span>
+                                    <span className="text-[10px] font-bold whitespace-nowrap text-slate-700">{c.name}</span>
                                 </button>
                             ))}
                         </div>
@@ -594,7 +611,7 @@ const ScheduleApp: React.FC = () => {
                             {filterCharactersByGroup(characters, characterGroups, anniCharGroupId).map(c => (
                                 <button key={c.id} onClick={() => setNewAnniChar(c.id)} className={`flex flex-col items-center gap-2 p-2 rounded-lg border transition-all min-w-[60px] ${newAnniChar === c.id ? `${currentThemeMode === 'minimal' ? 'shadow-[inset_2px_2px_5px_#d1d9e6,inset_-2px_-2px_5px_#ffffff]' : 'border-current'}` : 'border-transparent opacity-50'}`}>
                                     <TokenImg value={c.avatar} className="w-10 h-10 rounded-md object-cover" />
-                                    <span className={`text-[10px] font-bold whitespace-nowrap ${theme.text}`}>{c.name}</span>
+                                    <span className="text-[10px] font-bold whitespace-nowrap text-slate-700">{c.name}</span>
                                 </button>
                             ))}
                         </div>
@@ -606,3 +623,5 @@ const ScheduleApp: React.FC = () => {
 };
 
 export default ScheduleApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

@@ -67,7 +67,7 @@ describe('describeAmsgFetchFailure — 把 fetch 异常翻成人话', () => {
     expect(message).toContain('amsg.example.workers.dev');
     expect(message).toContain('连不上');
     // 三条自查线索都要在，缺一条就会有人往错的方向翻。
-    expect(message).toContain('Deno');
+    expect(message).toContain('直连教程');
     expect(message).toContain('地址填错');
     // 最要紧的一句：别让用户以为主动消息整个废了。
     expect(message).toContain('推送');
@@ -748,6 +748,34 @@ describe('buildAmsgDiagnosticRows — 定时任务的逐条细账', () => {
     expect(item?.raw).toContain('D1_ERROR');
   });
 
+  it('只有清理云端数据那一步在报错 → 提醒但不报红，说明消息照常投递', () => {
+    const row = tickRow('healthy', {
+      tickReport: {
+        ok: true,
+        report: tickReport({
+          tickFailure: {
+            stage: 'cloud-cleanup',
+            name: 'D1_ERROR',
+            message: 'no such table: cloud_cleanup_work',
+            code: null,
+            firstAt: at(30),
+            lastAt: at(1),
+            count: 30,
+            ongoing: true,
+          },
+        }),
+      },
+    });
+
+    expect(row.level).toBe('warn');
+    expect(row.detail).toContain('清理云端数据');
+    expect(row.detail).toContain('消息照常投递');
+    const item = row.items?.find((entry) => entry.text.includes('每分钟那一跳'));
+    expect(item?.text).toContain('清理云端数据那一步');
+    expect(item?.text).toContain('消息照常投递');
+    expect(item?.raw).toContain('no such table: cloud_cleanup_work');
+  });
+
   it('整轮报错认得出来的另外两种各给一句该怎么办；阶段代号翻成中文', () => {
     const failureRow = (patch: Record<string, unknown>) => tickRow('healthy', {
       tickReport: {
@@ -769,6 +797,10 @@ describe('buildAmsgDiagnosticRows — 定时任务的逐条细账', () => {
     expect(timeout?.text).toContain('没响应');
     expect(timeout?.text).toContain('给任务占位写库那一步');
     expect(timeout?.raw).toBe('Error: D1 query timed out (D1_TIMEOUT)');
+
+    const storageFull = failureRow({ message: 'D1_ERROR: Exceeded maximum DB size', code: 'D1_STORAGE_FULL' }).items?.[0];
+    expect(storageFull?.text).toContain('云端数据库满了');
+    expect(storageFull?.raw).toBe('Error: D1_ERROR: Exceeded maximum DB size (D1_STORAGE_FULL)');
 
     const cleanup = failureRow({ stage: 'post_send_cleanup_failed_advance' }).items?.[0];
     expect(cleanup?.text).toContain('发完之后写库那一步');
